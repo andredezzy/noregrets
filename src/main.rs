@@ -219,6 +219,10 @@ enum Cmd {
         /// per-deal difference — the value added by search itself.
         #[arg(long)]
         search_gain: bool,
+        /// Heads-up flops without a value net run the MCCFR resolve instead
+        /// of the blueprint (with --search / --search-gain).
+        #[arg(long)]
+        flop_resolve: bool,
         /// Paired net-gain mode: search WITH the value net vs search
         /// without it — isolates the value network's contribution.
         #[arg(long)]
@@ -784,6 +788,7 @@ fn main() {
             aivat,
             search,
             search_gain,
+            flop_resolve,
             net_gain,
             search_ms,
             search_iters,
@@ -827,6 +832,7 @@ fn main() {
                 time_ms: search_ms,
                 max_iters: search_iters,
                 adaptive: true,
+                flop_resolve,
                 ..SearchParams::default()
             };
             let r = if net_gain {

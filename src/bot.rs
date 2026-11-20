@@ -117,6 +117,21 @@ pub struct SearchParams {
     /// Multiway MCCFR resolves are rooted at the start of the current
     /// betting round (Pluribus) rather than at the current decision.
     pub round_root: bool,
+    /// Heads-up flops without a value net run the MCCFR resolve (as Pluribus
+    /// searched every postflop decision) instead of acting from the blueprint.
+    pub flop_resolve: bool,
+}
+
+/// Which part of the search routing produced a distribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchSource {
+    /// No solver claimed the spot: the blueprint (with its check/call
+    /// default on unseen infosets).
+    Blueprint,
+    River,
+    Turn,
+    FlopNet,
+    Resolve,
 }
 
 impl Default for SearchParams {
@@ -128,6 +143,7 @@ impl Default for SearchParams {
             safe_resolve: false,
             adaptive: false,
             round_root: true,
+            flop_resolve: false,
         }
     }
 }
@@ -294,20 +310,44 @@ impl Policy {
         params: SearchParams,
         train_cfg: &TrainConfig,
         tracker: Option<&RangeTracker>,
-        mut session: Option<&mut SearchSession>,
+        session: Option<&mut SearchSession>,
         round: Option<&RoundRoot>,
         rng: &mut SmallRng,
     ) -> (Vec<AbsAction>, Vec<f64>) {
+        let (acts, probs, _) = self.search_dist_sourced(
+            real, shadow, hist, params, train_cfg, tracker, session, round, rng,
+        );
+        (acts, probs)
+    }
+
+    /// `search_dist`, also naming the part of the routing that answered, so
+    /// a caller can tell a solved spot from the blueprint fallback.
+    pub fn search_dist_sourced(
+        &self,
+        real: &Hand,
+        shadow: &Hand,
+        hist: &[u8],
+        params: SearchParams,
+        train_cfg: &TrainConfig,
+        tracker: Option<&RangeTracker>,
+        mut session: Option<&mut SearchSession>,
+        round: Option<&RoundRoot>,
+        rng: &mut SmallRng,
+    ) -> (Vec<AbsAction>, Vec<f64>, SearchSource) {
+        let blueprint = |rng: &mut SmallRng| {
+            let (a, p) = self.blueprint_dist(shadow, hist, rng);
+            (a, p, SearchSource::Blueprint)
+        };
         if real.street() == Street::Preflop {
-            return self.blueprint_dist(shadow, hist, rng);
+            return blueprint(rng);
         }
         // River spots with two live players: exact range-vs-range CFR+
         // (river.rs) instead of sampled MCCFR.
         if real.street() == Street::River && real.live_count() == 2 {
             if let Some(tr) = tracker {
                 let sess = session.as_deref();
-                if let Some(d) = self.river_dist(real, hist, tr, params, sess, rng) {
-                    return d;
+                if let Some((a, p)) = self.river_dist(real, hist, tr, params, sess, rng) {
+                    return (a, p, SearchSource::River);
                 }
             }
         }
@@ -318,8 +358,8 @@ impl Policy {
         if real.street() == Street::Turn && real.live_count() == 2 {
             if let Some(tr) = tracker {
                 let sess = session.as_deref_mut();
-                if let Some(d) = self.turn_dist(real, hist, tr, params, sess, rng) {
-                    return d;
+                if let Some((a, p)) = self.turn_dist(real, hist, tr, params, sess, rng) {
+                    return (a, p, SearchSource::Turn);
                 }
             }
         }
@@ -327,15 +367,17 @@ impl Policy {
         // depth-limited vector solving with learned leaf values.
         if real.street() == Street::Flop && real.live_count() == 2 {
             if let (Some(tr), Some(net)) = (tracker, &self.value_net) {
-                if let Some(d) = self.flop_net_dist(real, tr, net, params, rng) {
-                    return d;
+                if let Some((a, p)) = self.flop_net_dist(real, tr, net, params, rng) {
+                    return (a, p, SearchSource::FlopNet);
                 }
             }
             // Without a net, a table-budget MCCFR resolve is worse than the
             // blueprint here (measured: ≈0 in self-play; vs Slumbot it got
             // 200bb in at ~18% equity on 51 flops in 10k hands). The exact
             // turn/river solvers take over on later streets.
-            return self.blueprint_dist(shadow, hist, rng);
+            if !params.flop_resolve {
+                return blueprint(rng);
+            }
         }
         let leaf = (real.street() == Street::Flop).then(|| LeafCfg {
             blueprint: self.blueprint.clone(),
@@ -378,10 +420,10 @@ impl Policy {
         if let Some(s) = solver.avg_strategy(bucket, hist) {
             let acts = solver.abs.abstract_actions(real);
             if s.len() == acts.len() {
-                return (acts, s);
+                return (acts, s, SearchSource::Resolve);
             }
         }
-        self.blueprint_dist(shadow, hist, rng)
+        blueprint(rng)
     }
 
     /// Depth-limited flop resolve over both players' tracked ranges with
