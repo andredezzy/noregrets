@@ -5,6 +5,14 @@ edition = "2021"
 license = "MIT"
 description = "Pluribus-style 2-6 player no-limit hold'em bot (6-max primary): Linear MCCFR blueprint + online subgame resolving"
 
+[lib]
+name = "pluribus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pluribus"
+path = "src/main.rs"
+
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
 mimalloc = "0.1"

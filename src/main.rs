@@ -1,41 +1,16 @@
-mod ablate;
-mod abstraction;
-mod aivat;
-mod benchmark;
-mod bot;
-mod br;
-mod cards;
-mod cfr;
-mod clone;
-mod distill;
-mod engine;
-mod eval;
-mod flop;
-mod lbr;
-mod net;
-mod play;
-mod portfolio;
-mod river;
-mod search;
-mod slumbot;
-mod table;
-mod turn;
-mod valuenet;
-
 // Solver walks allocate range-vector scratch at every node visit; mimalloc
 // is measurably faster than the system allocator on that churn.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use abstraction::{AbsConfig, Abstraction, Centroids};
-use bot::{Policy, SearchParams};
-use cfr::{Blueprint, TrainConfig, Trainer};
+use pluribus::abstraction::{AbsConfig, Abstraction, Centroids, MenuShape};
+use pluribus::bot::{Policy, SearchParams};
+use pluribus::cfr::{Blueprint, TrainConfig, Trainer};
+use pluribus::engine::HandConfig;
+use pluribus::table::Baseline;
 use clap::{Parser, Subcommand};
-use abstraction::MenuShape;
-use engine::HandConfig;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
-use table::Baseline;
 
 #[derive(Parser)]
 #[command(
@@ -583,7 +558,7 @@ fn main() {
                     // Adopt the clone's abstraction so bucket/history keys align.
                     let abs =
                         Abstraction::with_centroids(clone.abs_cfg.clone(), clone.centroids.clone());
-                    let rnr = Some(cfr::RnrCfg {
+                    let rnr = Some(pluribus::cfr::RnrCfg {
                         model: Baseline::Caller, // ignored when rnr_opp is set
                         p: rnr_p,
                     });
@@ -594,7 +569,7 @@ fn main() {
                 None => {
                     let strat_ctx = strategic_from.as_ref().map(|p| load_strat_ctx(p));
                     let table = bucket_table.as_ref().map(|path| {
-                        let t = abstraction::BucketTable::load(path)
+                        let t = pluribus::abstraction::BucketTable::load(path)
                             .unwrap_or_else(|e| die(&format!("cannot load bucket table '{path}': {e}")));
                         if !t.matches(&abs_cfg) {
                             die(&format!(
@@ -652,7 +627,7 @@ fn main() {
                     }
                     let rnr = rnr_model.map(|model| {
                         println!("RNR training: model {model:?}, p = {rnr_p}");
-                        cfr::RnrCfg { model, p: rnr_p }
+                        pluribus::cfr::RnrCfg { model, p: rnr_p }
                     });
                     Trainer::new(Arc::new(abs), train_cfg).with_rnr(rnr)
                 }
@@ -751,7 +726,7 @@ fn main() {
                     t0.elapsed().as_secs_f64()
                 );
             });
-            let table = abstraction::BucketTable {
+            let table = pluribus::abstraction::BucketTable {
                 cfg: abs_cfg,
                 centroids: Some(centroids),
                 entries: abs.canon_entries(),
@@ -777,13 +752,13 @@ fn main() {
             seed,
         } => {
             let net = value_net.map(|p| {
-                let n = valuenet::ValueNet::load(&p)
+                let n = pluribus::valuenet::ValueNet::load(&p)
                     .unwrap_or_else(|e| die(&format!("cannot load value net '{p}': {e}")));
                 println!("loaded value net from {p}");
                 Arc::new(n)
             });
             let policy = load_policy(&blueprint).with_value_net(net);
-            let opts = play::PlayOpts {
+            let opts = pluribus::play::PlayOpts {
                 cfg: HandConfig {
                     num_players: players,
                     ..HandConfig::default()
@@ -797,7 +772,7 @@ fn main() {
                 }),
                 seed,
             };
-            play::play(&policy, &opts);
+            pluribus::play::play(&policy, &opts);
         }
 
         Cmd::Eval {
@@ -817,7 +792,7 @@ fn main() {
             seed,
         } => {
             let net = value_net.map(|p| {
-                let n = valuenet::ValueNet::load(&p)
+                let n = pluribus::valuenet::ValueNet::load(&p)
                     .unwrap_or_else(|e| die(&format!("cannot load value net '{p}': {e}")));
                 println!("loaded value net from {p}");
                 Arc::new(n)
@@ -859,7 +834,7 @@ fn main() {
                     die("--net-gain needs --value-net");
                 }
                 let plain = policy.clone_without_net();
-                table::run_eval_paired_policies(
+                pluribus::table::run_eval_paired_policies(
                     &policy,
                     Some(params),
                     &plain,
@@ -869,15 +844,15 @@ fn main() {
                     seed,
                 )
             } else if search_gain {
-                table::run_eval_paired(&policy, &cfg, hands, params, seed)
+                pluribus::table::run_eval_paired(&policy, &cfg, hands, params, seed)
             } else if search {
-                table::run_eval_search(&policy, &cfg, baseline, hands, params, seed)
+                pluribus::table::run_eval_search(&policy, &cfg, baseline, hands, params, seed)
             } else if aivat {
-                aivat::run_eval_aivat(&policy, &cfg, baseline, hands, seed)
+                pluribus::aivat::run_eval_aivat(&policy, &cfg, baseline, hands, seed)
             } else if duplicate {
-                table::run_eval_duplicate(&policy, &cfg, baseline, hands / players as u64, seed)
+                pluribus::table::run_eval_duplicate(&policy, &cfg, baseline, hands / players as u64, seed)
             } else {
-                table::run_eval(&policy, &cfg, baseline, hands, seed)
+                pluribus::table::run_eval(&policy, &cfg, baseline, hands, seed)
             };
             println!(
                 "winrate: {:+.1} mbb/hand (95% CI ±{:.1}) over {} hands in {:.1}s",
@@ -928,9 +903,9 @@ fn main() {
             }
             let started = std::time::Instant::now();
             let r = if multiway {
-                lbr::run_lbr_multiway(&policy, &cfg, hands, runouts, seed, params)
+                pluribus::lbr::run_lbr_multiway(&policy, &cfg, hands, runouts, seed, params)
             } else {
-                lbr::run_lbr(&policy, &cfg, hands, runouts, seed)
+                pluribus::lbr::run_lbr(&policy, &cfg, hands, runouts, seed)
             };
             println!(
                 "LBR wins {:+.1} mbb/hand (95% CI ±{:.1}) over {} hands in {:.1}s",
@@ -940,7 +915,7 @@ fn main() {
                 started.elapsed().as_secs_f64()
             );
             println!("(lower bound on the blueprint's exploitability; 0 = unexploited)");
-            if let Some(r) = bot::fallback_report() {
+            if let Some(r) = pluribus::bot::fallback_report() {
                 println!("{r}");
             }
         }
@@ -980,7 +955,7 @@ fn main() {
                 }
             );
             let started = std::time::Instant::now();
-            let r = br::run_br(&policy, &cfg, hands, runouts, seed, params);
+            let r = pluribus::br::run_br(&policy, &cfg, hands, runouts, seed, params);
             println!(
                 "BR probe wins {:+.1} mbb/hand (95% CI ±{:.1}) over {} hands in {:.1}s",
                 r.mbb_per_hand,
@@ -996,7 +971,7 @@ fn main() {
                 "safety ablation: {spots} random river spots, {iters} CFR iters/solve..."
             );
             let started = std::time::Instant::now();
-            let rows = ablate::run(spots, iters, seed);
+            let rows = pluribus::ablate::run(spots, iters, seed);
             println!(
                 "\n{:<8} {:>13} {:>12} {:>11} {:>10} {:>9}",
                 "epsilon", "unsafe mean", "unsafe max", "safe mean", "safe max", "pot"
@@ -1028,13 +1003,13 @@ fn main() {
                  ({solve_iters} CFR iters or {solve_ms}ms per solve)..."
             );
             let started = std::time::Instant::now();
-            let data = valuenet::generate(&policy, solve_iters, solve_ms, samples, seed, &|done| {
+            let data = pluribus::valuenet::generate(&policy, solve_iters, solve_ms, samples, seed, &|done| {
                 println!(
                     "  {done}/{samples} samples ({:.1}s elapsed)",
                     started.elapsed().as_secs_f64()
                 );
             });
-            valuenet::save_samples(&out, &data)
+            pluribus::valuenet::save_samples(&out, &data)
                 .unwrap_or_else(|e| die(&format!("cannot write {out}: {e}")));
             println!(
                 "wrote {} samples to {out} in {:.1}s",
@@ -1056,7 +1031,7 @@ fn main() {
             // generation batches).
             let mut samples = Vec::new();
             for path in data.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                let mut s = valuenet::load_samples(path)
+                let mut s = pluribus::valuenet::load_samples(path)
                     .unwrap_or_else(|e| die(&format!("cannot load {path}: {e}")));
                 println!("loaded {} samples from {path}", s.len());
                 samples.append(&mut s);
@@ -1070,7 +1045,7 @@ fn main() {
                 samples.len()
             );
             let started = std::time::Instant::now();
-            let (net, val_loss) = valuenet::train(
+            let (net, val_loss) = pluribus::valuenet::train(
                 &samples,
                 &hidden,
                 epochs,
@@ -1106,7 +1081,7 @@ fn main() {
             seed,
         } => {
             let net = value_net.map(|p| {
-                let n = valuenet::ValueNet::load(&p)
+                let n = pluribus::valuenet::ValueNet::load(&p)
                     .unwrap_or_else(|e| die(&format!("cannot load value net '{p}': {e}")));
                 println!("loaded value net from {p}");
                 Arc::new(n)
@@ -1116,7 +1091,7 @@ fn main() {
                 num_players: policy.blueprint.num_players,
                 ..HandConfig::default()
             };
-            let dcfg = distill::DistillCfg {
+            let dcfg = pluribus::distill::DistillCfg {
                 hands,
                 params: SearchParams {
                     time_ms: search_ms,
@@ -1131,7 +1106,7 @@ fn main() {
                 cfg.num_players
             );
             let started = std::time::Instant::now();
-            let (records, samples) = distill::collect(&policy, &cfg, &dcfg);
+            let (records, samples) = pluribus::distill::collect(&policy, &cfg, &dcfg);
             println!(
                 "collected {samples} searched decisions at {} infosets in {:.1}s",
                 records.len(),
@@ -1139,10 +1114,10 @@ fn main() {
             );
             // Reclaim sole ownership of the blueprint so the merge mutates
             // in place instead of cloning a multi-GB map.
-            let bot::Policy { blueprint: bp_arc, .. } = policy;
+            let pluribus::bot::Policy { blueprint: bp_arc, .. } = policy;
             let owned = Arc::try_unwrap(bp_arc)
                 .unwrap_or_else(|arc| (*arc).clone());
-            let (bp2, updated, skipped) = distill::merge(owned, &records, alpha);
+            let (bp2, updated, skipped) = pluribus::distill::merge(owned, &records, alpha);
             bp2.save(&out)
                 .unwrap_or_else(|e| die(&format!("save failed: {e}")));
             println!(
@@ -1180,12 +1155,12 @@ fn main() {
                 ..HandConfig::default()
             };
             println!("cross-play: {focal} (1 seat) vs {field} (rest), {hands} hands...");
-            let r = table::run_crossplay(&focal_p, &field_p, &cfg, hands, seed);
+            let r = pluribus::table::run_crossplay(&focal_p, &field_p, &cfg, hands, seed);
             println!(
                 "focal winrate: {:+.1} mbb/hand (95% CI ±{:.1}) over {} hands",
                 r.mbb_per_hand, r.ci95, r.hands
             );
-            if let Some(r) = bot::fallback_report() {
+            if let Some(r) = pluribus::bot::fallback_report() {
                 println!("{r}");
             }
         }
@@ -1204,7 +1179,7 @@ fn main() {
             log,
         } => {
             let net = value_net.map(|p| {
-                let n = valuenet::ValueNet::load(&p)
+                let n = pluribus::valuenet::ValueNet::load(&p)
                     .unwrap_or_else(|e| die(&format!("cannot load value net '{p}': {e}")));
                 println!("loaded value net from {p}");
                 Arc::new(n)
@@ -1213,7 +1188,7 @@ fn main() {
             if policy.blueprint.num_players != 2 {
                 die("Slumbot is heads-up: train with --players 2 --stack 20000");
             }
-            let mut transport = slumbot::HttpTransport;
+            let mut transport = pluribus::slumbot::HttpTransport;
             let token = match (username, password) {
                 (Some(u), Some(p)) => Some(
                     transport
@@ -1222,7 +1197,7 @@ fn main() {
                 ),
                 _ => None,
             };
-            let cfg = slumbot::SlumbotCfg {
+            let cfg = pluribus::slumbot::SlumbotCfg {
                 hands,
                 search: search.then_some(SearchParams {
                     time_ms: search_ms,
@@ -1236,7 +1211,7 @@ fn main() {
             };
             println!("playing {hands} hands vs Slumbot (search: {search})...");
             let started = std::time::Instant::now();
-            let r = slumbot::run(&policy, &mut transport, &cfg, &mut |h, mean| {
+            let r = pluribus::slumbot::run(&policy, &mut transport, &cfg, &mut |h, mean| {
                 println!("  {h} hands, running mean {mean:+.0} mbb/hand");
             })
             .unwrap_or_else(|e| die(&format!("slumbot session failed: {e}")));
@@ -1259,7 +1234,7 @@ fn main() {
             holdout,
         } => {
             let policy = load_policy(&blueprint);
-            let (bp, stats) = clone::build(&log, &policy.abs, holdout)
+            let (bp, stats) = pluribus::clone::build(&log, &policy.abs, holdout)
                 .unwrap_or_else(|e| die(&format!("clone build failed: {e}")));
             println!(
                 "clone: {} hands ({} skipped), {} decisions, {} infosets",
@@ -1291,7 +1266,7 @@ fn main() {
             for k in bp.strategies.keys() {
                 let seps = k[2..]
                     .iter()
-                    .filter(|&&t| t == abstraction::TOKEN_STREET_SEP)
+                    .filter(|&&t| t == pluribus::abstraction::TOKEN_STREET_SEP)
                     .count()
                     .min(3);
                 by_street[seps] += 1;
@@ -1305,7 +1280,7 @@ fn main() {
             let policy = load_policy(&blueprint);
             println!("replaying Pluribus hands from {dir}...");
             let started = std::time::Instant::now();
-            let r = benchmark::run(&dir, &policy)
+            let r = pluribus::benchmark::run(&dir, &policy)
                 .unwrap_or_else(|e| die(&format!("benchmark failed: {e}")));
             println!(
                 "replayed {} hands in {:.1}s ({} skipped, {} desynced)",
@@ -1325,7 +1300,7 @@ fn main() {
                 "\n{:<8} {:>10} {:>10} {:>12} {:>12}",
                 "street", "decisions", "covered", "top-1 agree", "mean prob"
             );
-            let mut tot = benchmark::StreetStats::default();
+            let mut tot = pluribus::benchmark::StreetStats::default();
             for (i, name) in ["preflop", "flop", "turn", "river"].iter().enumerate() {
                 let s = &r.by_street[i];
                 print_bench_row(name, s);
@@ -1339,7 +1314,7 @@ fn main() {
     }
 }
 
-fn print_bench_row(name: &str, s: &benchmark::StreetStats) {
+fn print_bench_row(name: &str, s: &pluribus::benchmark::StreetStats) {
     let pct = |num: u64, den: u64| {
         if den == 0 {
             "-".to_string()
@@ -1364,7 +1339,7 @@ fn print_bench_row(name: &str, s: &benchmark::StreetStats) {
 
 /// Previous-round context for strategic abstractions. The referenced
 /// blueprint must itself use an equity abstraction (one co-training level).
-fn load_strat_ctx(path: &str) -> abstraction::StratCtx {
+fn load_strat_ctx(path: &str) -> pluribus::abstraction::StratCtx {
     let bp = Blueprint::load(path)
         .unwrap_or_else(|e| die(&format!("cannot load previous blueprint '{path}': {e}")));
     if bp.centroids.as_ref().is_some_and(|c| c.is_strategic()) {
@@ -1376,7 +1351,7 @@ fn load_strat_ctx(path: &str) -> abstraction::StratCtx {
         bp.abs_cfg.postflop_buckets
     );
     let abs = Abstraction::with_centroids(bp.abs_cfg.clone(), bp.centroids.clone());
-    abstraction::StratCtx {
+    pluribus::abstraction::StratCtx {
         bp: Arc::new(bp),
         abs: Arc::new(abs),
         rollouts: 16,
