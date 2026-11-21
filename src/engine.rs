@@ -155,12 +155,10 @@ impl Hand {
 
         match a {
             PlayerAction::Fold => {
-                // Folding with nothing to call is treated as a check.
-                if self.to_call() == 0 {
-                    self.acted[p] = true;
-                } else {
-                    self.folded[p] = true;
-                }
+                // Folding with nothing to call still folds, as rooms let a
+                // player do (Brasa, live): abstract menus never offer it.
+                self.acted[p] = true;
+                self.folded[p] = true;
             }
             PlayerAction::CheckCall => {
                 let pay = self.to_call().min(self.stacks[p]);

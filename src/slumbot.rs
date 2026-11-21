@@ -89,8 +89,8 @@ pub fn parse_incr(action: &str, from: usize) -> Result<(Vec<SlumAct>, usize), St
     Ok((out, i))
 }
 
-/// Our concrete engine action → Slumbot incr string. The engine treats a
-/// fold-when-free as a check; Slumbot rejects it, so map it to "k".
+/// Our concrete engine action → Slumbot incr string. Slumbot rejects a
+/// fold-when-free, so map it to "k".
 pub fn to_incr(a: PlayerAction, to_call: u32) -> String {
     match a {
         PlayerAction::Fold => {

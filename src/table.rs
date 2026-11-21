@@ -90,7 +90,7 @@ impl Table {
         match a {
             PlayerAction::Fold => {
                 if self.real.can_check() {
-                    AbsAction::CheckCall // engine treats fold-when-free as check
+                    AbsAction::CheckCall // the blueprint never folds when free: the shadow checks
                 } else {
                     AbsAction::Fold
                 }
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn folding_when_free_records_check() {
+    fn folding_when_free_folds_the_real_hand_and_the_shadow_checks() {
         let abs = abs_small();
         let mut t = Table::new(&HandConfig::default(), 0, fresh_deck());
         for _ in 0..5 {
@@ -629,9 +629,11 @@ mod tests {
         }
         assert!(t.real.can_check()); // BB option
         t.apply_concrete(PlayerAction::Fold, &abs);
-        // Engine treats fold-when-free as a check; history must agree.
+        // Rooms let a player fold for free: the real hand loses the BB, the
+        // blueprint's history (which never folds when free) records a check.
         assert_eq!(*t.hist.last().unwrap(), TOKEN_STREET_SEP);
-        assert!(!t.real.folded(2));
+        assert!(t.real.folded(2));
+        assert!(!t.shadow.folded(2));
         assert_eq!(t.real.street(), crate::engine::Street::Flop);
     }
 
