@@ -379,11 +379,13 @@ impl Policy {
                 return blueprint(rng);
             }
         }
-        let leaf = (real.street() == Street::Flop).then(|| LeafCfg {
-            blueprint: self.blueprint.clone(),
-            abs: self.abs.clone(),
-            limit: Street::Flop,
-        });
+        let leaf = || {
+            (real.street() == Street::Flop).then(|| LeafCfg {
+                blueprint: self.blueprint.clone(),
+                abs: self.abs.clone(),
+                limit: Street::Flop,
+            })
+        };
         let sabs = self.search_abs.clone().unwrap_or_else(|| self.abs.clone());
         let p = real.to_act();
         // Round-start rooting: solve from the start of this betting round
@@ -394,34 +396,40 @@ impl Policy {
                 && r.real.street() == real.street()
                 && r.hist_len + r.actions.len() == hist.len()
         });
-        let solver = match round {
-            Some(r) => {
-                let spine = Spine {
-                    hero: p,
-                    base_len: r.hist_len,
-                    steps: r.actions.clone(),
-                    tokens: hist[r.hist_len..].to_vec(),
-                };
-                let start = tracker.map(|t| t.at_round_start());
-                resolve_subgame(
-                    sabs.clone(),
-                    train_cfg,
-                    &r.real,
-                    &hist[..r.hist_len],
-                    params,
-                    start.as_ref(),
-                    leaf,
-                    Some(spine),
-                )
-            }
-            None => resolve_subgame(sabs, train_cfg, real, hist, params, tracker, leaf, None),
-        };
-        let bucket = solver.abs.bucket(real.hole(p), real.board(), rng);
-        if let Some(s) = solver.avg_strategy(bucket, hist) {
+        let bucket = sabs.bucket(real.hole(p), real.board(), rng);
+        let strategy_at = |solver: &crate::cfr::Trainer| {
+            let s = solver.avg_strategy(bucket, hist)?;
             let acts = solver.abs.abstract_actions(real);
-            if s.len() == acts.len() {
+            (s.len() == acts.len()).then_some((acts, s))
+        };
+        if let Some(r) = round {
+            let spine = Spine {
+                hero: p,
+                base_len: r.hist_len,
+                steps: r.actions.clone(),
+                tokens: hist[r.hist_len..].to_vec(),
+            };
+            let start = tracker.map(|t| t.at_round_start());
+            let solver = resolve_subgame(
+                sabs.clone(),
+                train_cfg,
+                &r.real,
+                &hist[..r.hist_len],
+                params,
+                start.as_ref(),
+                leaf(),
+                Some(spine),
+            );
+            if let Some((acts, s)) = strategy_at(&solver) {
                 return (acts, s, SearchSource::Resolve);
             }
+        }
+        // A round-rooted resolve samples the whole round and can miss the
+        // hero's infoset (a 3-way flop facing a shove, live): rooted at the
+        // decision itself, every hero iteration passes through it.
+        let solver = resolve_subgame(sabs, train_cfg, real, hist, params, tracker, leaf(), None);
+        if let Some((acts, s)) = strategy_at(&solver) {
+            return (acts, s, SearchSource::Resolve);
         }
         blueprint(rng)
     }
