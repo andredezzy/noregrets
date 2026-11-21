@@ -193,6 +193,14 @@ impl RangeTracker {
             .collect();
     }
 
+    /// Bayes-update `seat`'s range by a per-combo likelihood of its action
+    /// (indexed like `all_combos`) from a model other than the blueprint.
+    pub fn observe_likelihood(&mut self, seat: usize, likelihood: &[f64]) {
+        for (w, &l) in self.weights[seat].iter_mut().zip(likelihood) {
+            *w *= l;
+        }
+    }
+
     /// Sample hole cards for every non-folded seat from the tracked ranges,
     /// avoiding the board and each other. Folded seats stay `None` (their
     /// dead cards are drawn uniformly by the engine). Falls back to `None`
