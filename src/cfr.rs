@@ -827,20 +827,24 @@ impl Trainer {
     }
 
     /// Full checkpoint (regrets + strategy sums) for resuming training.
+    ///
+    /// The nodes stream straight from the table (a copy of a 1.5B-iteration
+    /// tree doubles its memory, and the system killed the 2B run at 1.475B),
+    /// into a temporary file renamed over `path` only once it is complete.
     pub fn save_checkpoint(&self, path: &str) -> std::io::Result<()> {
-        let snapshot: Vec<(Vec<u8>, Node)> = self
-            .nodes
-            .iter()
-            .map(|e| (e.key().to_vec(), e.value().clone()))
-            .collect();
-        let ckpt = Checkpoint {
+        use std::io::Write;
+        let ckpt = CheckpointRef {
             iterations: self.iterations(),
-            abs_cfg: self.abs.cfg.clone(),
-            centroids: self.abs.centroids.clone(),
-            nodes: snapshot,
+            abs_cfg: &self.abs.cfg,
+            centroids: &self.abs.centroids,
+            nodes: NodesRef(&self.nodes),
         };
-        let f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        bincode::serialize_into(f, &ckpt).map_err(std::io::Error::other)
+        let tmp = format!("{path}.tmp");
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        bincode::serialize_into(&mut f, &ckpt).map_err(std::io::Error::other)?;
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
     }
 
     /// Resume from a checkpoint. The card abstraction (config + k-means
@@ -883,6 +887,29 @@ struct Checkpoint {
     abs_cfg: AbsConfig,
     centroids: Option<Centroids>,
     nodes: Vec<(Vec<u8>, Node)>,
+}
+
+/// Serializes exactly like [`Checkpoint`], borrowing the trainer's state.
+#[derive(Serialize)]
+struct CheckpointRef<'a> {
+    iterations: u64,
+    abs_cfg: &'a AbsConfig,
+    centroids: &'a Option<Centroids>,
+    nodes: NodesRef<'a>,
+}
+
+/// The node table as the `Vec<(Vec<u8>, Node)>` a checkpoint stores.
+struct NodesRef<'a>(&'a DashMap<InfoKey, Node, ahash::RandomState>);
+
+impl Serialize for NodesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for e in self.0.iter() {
+            seq.serialize_element(&(&e.key()[..], e.value()))?;
+        }
+        seq.end()
+    }
 }
 
 fn leaf_key(bucket: u16, hist: &[u8]) -> InfoKey {

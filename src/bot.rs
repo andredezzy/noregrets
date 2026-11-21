@@ -836,6 +836,7 @@ mod tests {
                 safe_resolve: false,
                 adaptive: false,
                 round_root: true,
+                flop_resolve: false,
             },
             None,
             None,
@@ -1030,6 +1031,7 @@ mod tests {
                 safe_resolve: true,
                 adaptive: false,
                 round_root: true,
+                flop_resolve: false,
             },
             &train_cfg,
             Some(&tracker),
@@ -1106,6 +1108,7 @@ mod tests {
                     safe_resolve: safe,
                     adaptive: false,
                     round_root: true,
+                    flop_resolve: false,
                 },
                 &train_cfg,
                 Some(&tracker),
@@ -1173,6 +1176,7 @@ mod tests {
             safe_resolve: true,
             adaptive: false,
             round_root: true,
+            flop_resolve: false,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         for _ in 0..4 {
@@ -1305,6 +1309,7 @@ mod tests {
             safe_resolve: true,
             adaptive: false,
             round_root: true,
+            flop_resolve: false,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         table.apply_abs(AbsAction::CheckCall, &abs);
@@ -1414,6 +1419,7 @@ mod tests {
             safe_resolve: false,
             adaptive: false,
             round_root: true,
+            flop_resolve: false,
         };
         // EV of calling 800 real: .42(+900) - .58(900) = -144 < fold -100.
         let mut rng = SmallRng::seed_from_u64(9);
@@ -1502,6 +1508,7 @@ mod tests {
                 safe_resolve: false,
                 adaptive: false,
                 round_root: true,
+                flop_resolve: false,
             },
             Some(&tracker),
             Some(LeafCfg {
