@@ -70,6 +70,8 @@ pub struct TrainConfig {
     /// with an uncapped weight regrets grow ~t^2 over a long run and the
     /// fixed pruning threshold turns over-aggressive. u64::MAX = uncapped.
     pub linear_cap: u64,
+    /// The house's cut of every contested pot, in basis points (0 = rake free).
+    pub rake_bp: u32,
 }
 
 impl Default for TrainConfig {
@@ -84,6 +86,7 @@ impl Default for TrainConfig {
             snapshot_avg: false,
             multiway_focus: 0.0,
             linear_cap: u64::MAX,
+            rake_bp: 0,
         }
     }
 }
@@ -366,10 +369,11 @@ impl Trainer {
                 let traverser = (t % n as u64) as usize;
                 let mut deck = fresh_deck();
                 deck.shuffle(&mut rng);
-                let hand = Hand::new(&self.cfg.hand, 0, deck);
+                let mut hand = Hand::new(&self.cfg.hand, 0, deck);
                 if hand.is_terminal() {
                     continue; // degenerate deal (e.g. blinds all-in, tiny stacks)
                 }
+                hand.set_rake(self.cfg.rake_bp);
                 let weight = t.min(self.cfg.linear_cap) as f64;
                 // Pluribus mode decides pruning once per traversal; the
                 // per-action mode keeps prune_ok on and rolls per action.

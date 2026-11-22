@@ -135,6 +135,9 @@ enum Cmd {
         /// uncapped.
         #[arg(long, default_value_t = u64::MAX)]
         linear_cap: u64,
+        /// The house's cut of every contested pot, in basis points (Brasa: 500, uncapped).
+        #[arg(long, default_value_t = 0)]
+        rake_bp: u32,
         /// Worker threads (default: all cores).
         #[arg(long)]
         threads: Option<usize>,
@@ -509,6 +512,7 @@ fn main() {
             snapshot_avg,
             multiway_focus,
             linear_cap,
+            rake_bp,
             threads,
         } => {
             if let Some(t) = threads {
@@ -537,6 +541,7 @@ fn main() {
                 snapshot_avg,
                 multiway_focus,
                 linear_cap,
+                rake_bp,
                 ..TrainConfig::default()
             };
             let trainer = match &resume {
@@ -630,7 +635,7 @@ fn main() {
                         abs = abs.with_strat(sc);
                     }
                     let rnr = rnr_model.map(|model| {
-                        println!("RNR training: model {model:?}, p = {rnr_p}");
+                        println!("RNR training: model {model:?}, p = {rnr_p}, rake {rake_bp} bp");
                         pluribus::cfr::RnrCfg { model, p: rnr_p }
                     });
                     Trainer::new(Arc::new(abs), train_cfg).with_rnr(rnr)

@@ -159,6 +159,8 @@ pub enum Baseline {
     Random,
     /// Always check/call.
     Caller,
+    /// Brasa's players, as measured (see `brasa`).
+    Brasa,
 }
 
 impl std::str::FromStr for Baseline {
@@ -167,7 +169,8 @@ impl std::str::FromStr for Baseline {
         match s.to_ascii_lowercase().as_str() {
             "random" => Ok(Baseline::Random),
             "caller" => Ok(Baseline::Caller),
-            other => Err(format!("unknown baseline '{other}' (random|caller)")),
+            "brasa" => Ok(Baseline::Brasa),
+            other => Err(format!("unknown baseline '{other}' (random|caller|brasa)")),
         }
     }
 }
@@ -175,6 +178,7 @@ impl std::str::FromStr for Baseline {
 pub fn baseline_action(b: Baseline, h: &Hand, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
     match b {
         Baseline::Caller => AbsAction::CheckCall,
+        Baseline::Brasa => crate::brasa::action(h, abs, rng),
         Baseline::Random => {
             let acts = abs.abstract_actions(h);
             acts[rng.random_range(0..acts.len())]

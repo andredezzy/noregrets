@@ -3,6 +3,7 @@ pub mod abstraction;
 pub mod aivat;
 pub mod benchmark;
 pub mod bot;
+pub mod brasa;
 pub mod br;
 pub mod cards;
 pub mod cfr;
