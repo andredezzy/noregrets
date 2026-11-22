@@ -17,8 +17,11 @@ pub(crate) struct Arena {
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
-/// Words per arena chunk (16 MiB), touched only as records fill it.
-const CHUNK_WORDS: usize = 1 << 22;
+/// Words in an arena's first chunk (1 KiB); each next chunk doubles, up to `MAX_CHUNK_WORDS`
+/// (1 MiB). A search's trainer fills a few KiB in each of its 1,024 shards, and a fixed 16 MiB
+/// chunk held up to 16 GB per search: a simulation of four searches at once reached 58 GB.
+const FIRST_CHUNK_WORDS: usize = 1 << 8;
+const MAX_CHUNK_WORDS: usize = 1 << 18;
 
 impl Arena {
     pub fn new() -> Self {
@@ -28,7 +31,8 @@ impl Arena {
     fn alloc(&mut self, words: usize) -> NonNull<u32> {
         let room = self.chunks.last().map_or(0, |&(_, len)| len - self.used);
         if room < words {
-            let len = CHUNK_WORDS.max(words);
+            let next = self.chunks.last().map_or(FIRST_CHUNK_WORDS, |&(_, len)| (2 * len).min(MAX_CHUNK_WORDS));
+            let len = next.max(words);
             let chunk = Box::into_raw(vec![0u32; len].into_boxed_slice()) as *mut u32;
             self.chunks.push((NonNull::new(chunk).expect("Box is never null"), len));
             self.used = 0;
