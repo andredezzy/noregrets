@@ -81,6 +81,8 @@ pub struct Hand {
     min_raise_inc: u32,
     n_raises: u8,
     terminal: bool,
+    /// The house's cut of every contested pot, in basis points (500 = 5%); 0 trains and plays rake free.
+    rake_bp: u32,
 }
 
 impl Hand {
@@ -128,6 +130,7 @@ impl Hand {
             min_raise_inc: cfg.bb,
             n_raises: 0,
             terminal: false,
+            rake_bp: 0,
         };
         h.stacks[..n].copy_from_slice(stacks);
 
@@ -196,14 +199,40 @@ impl Hand {
         self.advance(p);
     }
 
-    /// Net chip result per seat. Only valid when terminal.
+    /// Rake every contested pot by `bp` basis points from here on; clones carry it.
+    pub fn set_rake(&mut self, bp: u32) {
+        self.rake_bp = bp;
+    }
+
+    /// The house's cut of a contested pot of `chips`.
+    pub fn rake_of(&self, chips: f64) -> f64 {
+        chips * f64::from(self.rake_bp) / 10_000.0
+    }
+
+    /// Net chip result per seat, after the rake on every layer more than one player paid into
+    /// (an uncalled bet comes back whole). Only valid when terminal.
     pub fn utilities(&self) -> [i64; MAX_PLAYERS] {
         debug_assert!(self.terminal);
         let mut winnings = [0u64; MAX_PLAYERS];
+        let raked = |layer: u64, payers: usize| {
+            if payers > 1 {
+                layer - layer * u64::from(self.rake_bp) / 10_000
+            } else {
+                layer
+            }
+        };
 
         let live: Vec<usize> = (0..self.n).filter(|&p| !self.folded[p]).collect();
         if live.len() == 1 {
-            winnings[live[0]] = self.pot() as u64;
+            let w = live[0];
+            let called = (0..self.n)
+                .filter(|&p| p != w)
+                .map(|p| self.hand_commit[p])
+                .max()
+                .unwrap_or(0)
+                .min(self.hand_commit[w]);
+            let refund = u64::from(self.hand_commit[w] - called);
+            winnings[w] = raked(self.pot() as u64 - refund, 2) + refund;
         } else {
             // Showdown across side-pot layers.
             debug_assert_eq!(self.board_len, 5);
@@ -237,6 +266,8 @@ impl Hand {
                     .into_iter()
                     .filter(|&p| strength[p] == best)
                     .collect();
+                let payers = self.hand_commit[..self.n].iter().filter(|&&c| c > prev).count();
+                let layer = raked(layer, payers);
                 let share = layer / winners.len() as u64;
                 let mut rem = layer - share * winners.len() as u64;
                 for &w in &winners {
@@ -693,6 +724,32 @@ mod tests {
         assert_eq!(u[1], 3_000);
         assert_eq!(u[2], -5_000);
         assert_eq!(u.iter().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn brasa_rakes_five_percent_of_every_contested_layer_and_no_refund() {
+        let deck = deck_with_front("As Ah Ks Kh 2c 7d 3c 9d Jh 4s 8c");
+        let mut h = Hand::new_with_stacks(&cfg(3), 0, deck, &[1_000, 5_000, 5_000]);
+        h.set_rake(500);
+        h.apply(RaiseTo(1_000));
+        h.apply(RaiseTo(5_000));
+        h.apply(CheckCall);
+        let u = h.utilities();
+        // Main pot 3000 raked to 2850 for AA, side pot 8000 raked to 7600 for KK.
+        assert_eq!(u[0], 1_850);
+        assert_eq!(u[1], 2_600);
+        assert_eq!(u[2], -5_000);
+        assert_eq!(u.iter().sum::<i64>(), -550);
+
+        let mut h = Hand::new(&cfg(6), 0, fresh_deck());
+        h.set_rake(500);
+        h.apply(RaiseTo(1_000));
+        for _ in 0..5 {
+            h.apply(Fold);
+        }
+        // The blinds (150) and the called 100 of the raise are raked; the uncalled 900 comes back.
+        assert_eq!(h.utilities()[3], 150 - 12);
+        assert!(h.clone().rake_of(1_000.0) == 50.0);
     }
 
     #[test]

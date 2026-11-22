@@ -259,6 +259,8 @@ impl TurnSolver {
             );
             let matched = c0.min(c1);
             let dead = h.pot() as f64 - c0 - c1;
+            // WARNING: the rake on a showdown pot comes off the money the winner takes beyond its own, so it reads as less dead money.
+            let dead = dead - h.rake_of(2.0 * matched + dead);
             return match river_ix {
                 Some(ri) => {
                     self.terminals.push(Terminal::Showdown {
