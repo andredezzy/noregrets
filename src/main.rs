@@ -700,13 +700,10 @@ fn main() {
                 iters as f64 / secs,
                 trainer.node_count()
             );
-            let bp = trainer.to_blueprint();
-            bp.save(&out)
+            let strategies = trainer
+                .save_blueprint(&out)
                 .unwrap_or_else(|e| die(&format!("blueprint save failed: {e}")));
-            println!(
-                "blueprint saved to {out} ({} strategies)",
-                bp.strategies.len()
-            );
+            println!("blueprint saved to {out} ({strategies} strategies)");
         }
 
         Cmd::BucketTable {

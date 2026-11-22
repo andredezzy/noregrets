@@ -601,6 +601,7 @@ dependencies = [
  "bincode",
  "clap",
  "dashmap",
+ "hashbrown 0.14.5",
  "indicatif",
  "mimalloc",
  "rand",

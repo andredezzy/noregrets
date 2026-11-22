@@ -440,8 +440,9 @@ src/
 │                   flop/turn equity-distribution quantiles, optionally
 │                   concatenated with potential-aware OCHS features, clustered
 │                   by EMD k-medians; exact river equity buckets)
-├── cfr.rs          External-sampling Linear MCCFR: parallel (rayon+dashmap),
-│                   negative-regret pruning, CFR+ mode for subgames,
+├── cfr.rs          External-sampling Linear MCCFR: parallel (rayon), one
+│                   record per infoset in a sharded table (f32 regrets, f64
+│                   strategy sums), negative-regret pruning, CFR+ mode for subgames,
 │                   depth-limited leaves with biased continuation strategies,
 │                   logit-QRE opponent modeling, restricted Nash response,
 │                   checkpoints, blueprint export

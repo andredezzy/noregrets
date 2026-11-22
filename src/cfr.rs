@@ -17,16 +17,261 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use hashbrown::HashTable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub type InfoKey = Box<[u8]>;
 
+/// An infoset's regrets and strategy sums as a checkpoint stores them.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
     pub regret: Vec<f64>,
     pub strat: Vec<f64>,
+}
+
+/// Regrets and strategy sums by infoset, each node one [`Record`] with its key. A regret keeps
+/// f32: in all but 0.002% of the 1.87B-iteration 6-max tree's 205M nodes, a next update of one big
+/// blind stands over 1,000 times above f32's resolution of the regret it lands on. A strategy sum
+/// keeps f64: in the most visited nodes, which hold 70% of preflop's and 35% of postflop's visits,
+/// an update is 1 to 100 times f32's resolution of the sum, and later ones would round away. As a
+/// boxed key beside two `Vec<f64>` that tree took ~150 B a node, past what a 48 GB machine holds
+/// beside the live server.
+pub struct Nodes {
+    shards: Box<[RwLock<HashTable<Record>>]>,
+    hasher: ahash::RandomState,
+}
+
+/// `Nodes` has 2^SHARD_BITS shards.
+const SHARD_BITS: u32 = 10;
+
+fn is_postflop(key: &[u8]) -> bool {
+    key.len() > 2 && key[2..].contains(&TOKEN_STREET_SEP)
+}
+
+/// A node as one allocation behind a thin pointer: the key's length (u16 LE), the action count
+/// (u8), the key, the regrets as f32 LE, then the strategy sums as f64 LE.
+struct Record(std::ptr::NonNull<u8>);
+
+// A Record owns its allocation, like the Box<[u8]> it was made from.
+unsafe impl Send for Record {}
+unsafe impl Sync for Record {}
+
+impl Record {
+    fn size(key_len: usize, actions: usize) -> usize {
+        3 + key_len + 12 * actions
+    }
+
+    fn new(key: &[u8], regret: &[f64], strat: &[f64]) -> Record {
+        let n = regret.len();
+        let mut r = Vec::with_capacity(Record::size(key.len(), n));
+        r.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        r.push(n as u8);
+        r.extend_from_slice(key);
+        for &x in regret {
+            r.extend_from_slice(&(x as f32).to_le_bytes());
+        }
+        for &x in strat {
+            r.extend_from_slice(&x.to_le_bytes());
+        }
+        let raw = Box::into_raw(r.into_boxed_slice()) as *mut u8;
+        Record(std::ptr::NonNull::new(raw).expect("Box is never null"))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let p = self.0.as_ptr();
+        // SAFETY: `p` heads a live allocation of `Record::size` bytes, read off its own header.
+        unsafe {
+            let size = Record::size(u16::from_le_bytes([*p, *p.add(1)]) as usize, *p.add(2) as usize);
+            std::slice::from_raw_parts(p, size)
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        let size = self.bytes().len();
+        // SAFETY: as in `bytes`, and `&mut self` makes the access unique.
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), size) }
+    }
+
+    fn key(&self) -> &[u8] {
+        let b = self.bytes();
+        &b[3..3 + u16::from_le_bytes([b[0], b[1]]) as usize]
+    }
+
+    fn actions(&self) -> usize {
+        self.bytes()[2] as usize
+    }
+
+    /// The regrets then the strategy sums into `out` (twice the action count long).
+    fn read(&self, out: &mut [f64]) {
+        let b = self.bytes();
+        let n = b[2] as usize;
+        let at = 3 + u16::from_le_bytes([b[0], b[1]]) as usize;
+        let (regret, strat) = out.split_at_mut(n);
+        for (o, c) in regret.iter_mut().zip(b[at..at + 4 * n].as_chunks::<4>().0) {
+            *o = f32::from_le_bytes(*c) as f64;
+        }
+        for (o, c) in strat.iter_mut().zip(b[at + 4 * n..].as_chunks::<8>().0) {
+            *o = f64::from_le_bytes(*c);
+        }
+    }
+
+    fn write(&mut self, values: &[f64]) {
+        let b = self.bytes_mut();
+        let n = b[2] as usize;
+        let at = 3 + u16::from_le_bytes([b[0], b[1]]) as usize;
+        let (regret, strat) = values.split_at(n);
+        for (c, &x) in b[at..at + 4 * n].as_chunks_mut::<4>().0.iter_mut().zip(regret) {
+            c.copy_from_slice(&(x as f32).to_le_bytes());
+        }
+        for (c, &x) in b[at + 4 * n..].as_chunks_mut::<8>().0.iter_mut().zip(strat) {
+            c.copy_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+impl Drop for Record {
+    fn drop(&mut self) {
+        let bytes: *mut [u8] = self.bytes_mut();
+        // SAFETY: the allocation came from `Box::into_raw` of a `Box<[u8]>` this long.
+        drop(unsafe { Box::from_raw(bytes) });
+    }
+}
+
+impl Nodes {
+    fn new() -> Self {
+        Nodes {
+            shards: (0..1usize << SHARD_BITS).map(|_| RwLock::new(HashTable::new())).collect(),
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    fn hash(&self, key: &[u8]) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// The shard below the hash's top 7 bits, which the table keeps for its control bytes.
+    fn shard(&self, hash: u64) -> &RwLock<HashTable<Record>> {
+        &self.shards[((hash << 7) >> (64 - SHARD_BITS)) as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.read().unwrap().len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Room for `n` nodes without a rehash (a checkpoint about to load).
+    fn reserve(&self, n: usize) {
+        let per_shard = n >> SHARD_BITS;
+        for shard in self.shards.iter() {
+            let mut t = shard.write().unwrap();
+            t.reserve(per_shard + per_shard / 32 + 64, |r| self.hash(r.key()));
+        }
+    }
+
+    /// `key`'s regrets into `out` (as long as its action count), the node created at zero on its
+    /// first visit.
+    fn regrets(&self, key: &[u8], out: &mut [f64]) {
+        let n = out.len();
+        let hash = self.hash(key);
+        let shard = self.shard(hash);
+        let mut values = [0.0f64; 2 * MAX_ACTS];
+        if let Some(r) = shard.read().unwrap().find(hash, |r| r.key() == key) {
+            r.read(&mut values[..2 * n]);
+            out.copy_from_slice(&values[..n]);
+            return;
+        }
+        let mut t = shard.write().unwrap();
+        match t.find(hash, |r| r.key() == key) {
+            Some(r) => {
+                r.read(&mut values[..2 * n]);
+                out.copy_from_slice(&values[..n]);
+            }
+            None => {
+                let zero = &values[..n];
+                t.insert_unique(hash, Record::new(key, zero, zero), |r| self.hash(r.key()));
+                out.fill(0.0);
+            }
+        }
+    }
+
+    /// Runs `f` on `key`'s regrets and strategy sums, when the node exists.
+    fn update(&self, key: &[u8], f: impl FnOnce(&mut [f64], &mut [f64])) {
+        let hash = self.hash(key);
+        let mut t = self.shard(hash).write().unwrap();
+        if let Some(r) = t.find_mut(hash, |r| r.key() == key) {
+            let n = r.actions();
+            let mut values = [0.0f64; 2 * MAX_ACTS];
+            r.read(&mut values[..2 * n]);
+            let (regret, strat) = values[..2 * n].split_at_mut(n);
+            f(regret, strat);
+            r.write(&values[..2 * n]);
+        }
+    }
+
+    fn insert(&self, key: &[u8], regret: &[f64], strat: &[f64]) {
+        let hash = self.hash(key);
+        let mut t = self.shard(hash).write().unwrap();
+        let fresh = Record::new(key, regret, strat);
+        match t.find_mut(hash, |r| r.key() == key) {
+            Some(r) => *r = fresh,
+            None => {
+                t.insert_unique(hash, fresh, |r| self.hash(r.key()));
+            }
+        }
+    }
+
+    /// `key`'s strategy sums, if visited.
+    fn strat(&self, key: &[u8]) -> Option<Vec<f64>> {
+        let hash = self.hash(key);
+        let t = self.shard(hash).read().unwrap();
+        let r = t.find(hash, |r| r.key() == key)?;
+        let mut values = vec![0.0; 2 * r.actions()];
+        r.read(&mut values);
+        Some(values.split_off(r.actions()))
+    }
+
+    /// Every node's key, regrets and strategy sums, until `f` fails.
+    fn try_for_each<E>(&self, mut f: impl FnMut(&[u8], &[f64], &[f64]) -> Result<(), E>) -> Result<(), E> {
+        let mut values = [0.0f64; 2 * MAX_ACTS];
+        for shard in self.shards.iter() {
+            for r in shard.read().unwrap().iter() {
+                let n = r.actions();
+                r.read(&mut values[..2 * n]);
+                let (regret, strat) = values[..2 * n].split_at(n);
+                f(r.key(), regret, strat)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn for_each(&self, mut f: impl FnMut(&[u8], &[f64], &[f64])) {
+        let _ = self.try_for_each(|key, regret, strat| {
+            f(key, regret, strat);
+            Ok::<(), std::convert::Infallible>(())
+        });
+    }
+
+    /// Every postflop node's regrets and strategy sums, for `f` to change.
+    fn for_each_postflop_mut(&self, mut f: impl FnMut(&mut [f64], &mut [f64])) {
+        let mut values = [0.0f64; 2 * MAX_ACTS];
+        for shard in self.shards.iter() {
+            for r in shard.write().unwrap().iter_mut() {
+                if !is_postflop(r.key()) {
+                    continue;
+                }
+                let n = r.actions();
+                r.read(&mut values[..2 * n]);
+                let (regret, strat) = values[..2 * n].split_at_mut(n);
+                f(regret, strat);
+                r.write(&values[..2 * n]);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +414,7 @@ pub struct RnrCfg {
 pub struct Trainer {
     pub abs: Arc<Abstraction>,
     pub cfg: TrainConfig,
-    nodes: DashMap<InfoKey, Node, ahash::RandomState>,
+    nodes: Nodes,
     iters_done: AtomicU64,
     leaf: Option<LeafCfg>,
     /// CFR+ mode (regrets floored at 0). Used for online subgame solves;
@@ -272,7 +517,7 @@ impl Trainer {
         Trainer {
             abs,
             cfg,
-            nodes: DashMap::with_hasher(ahash::RandomState::new()),
+            nodes: Nodes::new(),
             iters_done: AtomicU64::new(0),
             leaf: None,
             plus: false,
@@ -479,22 +724,8 @@ impl Trainer {
         // Snapshot sigma without holding the shard lock during recursion.
         let mut sigma_buf = [0.0f64; MAX_ACTS];
         let mut regrets_buf = [0.0f64; MAX_ACTS];
-        {
-            let snapshot = |node: &Node, sb: &mut [f64], rb: &mut [f64]| {
-                regret_matching_into(&node.regret, sb);
-                rb.copy_from_slice(&node.regret);
-            };
-            match self.nodes.get(key) {
-                Some(node) => snapshot(&node, &mut sigma_buf[..n], &mut regrets_buf[..n]),
-                None => {
-                    let node = self.nodes.entry(InfoKey::from(key)).or_insert_with(|| Node {
-                        regret: vec![0.0; n],
-                        strat: vec![0.0; n],
-                    });
-                    snapshot(&node, &mut sigma_buf[..n], &mut regrets_buf[..n]);
-                }
-            }
-        }
+        self.nodes.regrets(key, &mut regrets_buf[..n]);
+        regret_matching_into(&regrets_buf[..n], &mut sigma_buf[..n]);
         let sigma = &sigma_buf[..n];
         let regrets = &regrets_buf[..n];
 
@@ -556,15 +787,14 @@ impl Trainer {
                 node_util += sigma[i] * utils[i];
             }
 
-            if let Some(mut node) = self.nodes.get_mut(key) {
-                let floor = self.regret_floor();
+            let floor = self.regret_floor();
+            self.nodes.update(key, |regret, _| {
                 for i in 0..acts.len() {
                     if explore[i] {
-                        node.regret[i] =
-                            (node.regret[i] + weight * (utils[i] - node_util)).max(floor);
+                        regret[i] = (regret[i] + weight * (utils[i] - node_util)).max(floor);
                     }
                 }
-            }
+            });
             node_util
         } else if model_opp {
             // RNR model traversal: the opponent plays the fixed model and
@@ -613,11 +843,11 @@ impl Trainer {
                 None => sigma,
             };
             if !(self.cfg.snapshot_avg && h.street() != Street::Preflop) {
-                if let Some(mut node) = self.nodes.get_mut(key) {
-                    for (st, &d) in node.strat.iter_mut().zip(dist) {
+                self.nodes.update(key, |_, strat| {
+                    for (st, &d) in strat.iter_mut().zip(dist) {
                         *st += weight * d;
                     }
-                }
+                });
             }
             // Spine-targeted sampling at an opponent's spine node.
             // Off-policy sampling (spine targeting, multiway focus) draws
@@ -707,15 +937,10 @@ impl Trainer {
             }
             let bucket = self.abs.bucket(h.hole(p), h.board(), rng);
             let key = leaf_key(bucket, hist);
-            let sigma = {
-                let node = self.nodes.entry(key).or_insert_with(|| Node {
-                    regret: vec![0.0; LEAF_BIASES],
-                    strat: vec![0.0; LEAF_BIASES],
-                });
-                let mut s = Vec::with_capacity(LEAF_BIASES);
-                regret_matching(&node.regret, &mut s);
-                s
-            };
+            let mut regret = [0.0f64; LEAF_BIASES];
+            self.nodes.regrets(&key, &mut regret);
+            let mut sigma = [0.0f64; LEAF_BIASES];
+            regret_matching_into(&regret, &mut sigma);
             *bias = sample_index(&sigma, rng);
         }
 
@@ -725,15 +950,10 @@ impl Trainer {
 
         let bucket = self.abs.bucket(h.hole(traverser), h.board(), rng);
         let key = leaf_key(bucket, hist);
-        let sigma = {
-            let node = self.nodes.entry(key.clone()).or_insert_with(|| Node {
-                regret: vec![0.0; LEAF_BIASES],
-                strat: vec![0.0; LEAF_BIASES],
-            });
-            let mut s = Vec::with_capacity(LEAF_BIASES);
-            regret_matching(&node.regret, &mut s);
-            s
-        };
+        let mut regret = [0.0f64; LEAF_BIASES];
+        self.nodes.regrets(&key, &mut regret);
+        let mut sigma = [0.0f64; LEAF_BIASES];
+        regret_matching_into(&regret, &mut sigma);
         let mut utils = [0.0f64; LEAF_BIASES];
         let mut node_util = 0.0;
         for (b, u) in utils.iter_mut().enumerate() {
@@ -742,12 +962,12 @@ impl Trainer {
             *u = self.leaf_rollout(h, hist, &bs, traverser, lc, rng);
             node_util += sigma[b] * *u;
         }
-        if let Some(mut node) = self.nodes.get_mut(&key) {
-            let floor = self.regret_floor();
-            for (r, &u) in node.regret.iter_mut().zip(&utils) {
+        let floor = self.regret_floor();
+        self.nodes.update(&key, |regret, _| {
+            for (r, &u) in regret.iter_mut().zip(&utils) {
                 *r = (*r + weight * (u - node_util)).max(floor);
             }
-        }
+        });
         node_util
     }
 
@@ -790,37 +1010,31 @@ impl Trainer {
     /// Returns the number of infosets snapshotted.
     pub fn snapshot_strategy(&self) -> usize {
         let mut n = 0;
-        let mut s = Vec::new();
-        for mut e in self.nodes.iter_mut() {
-            let postflop = e.key()[2..].contains(&TOKEN_STREET_SEP);
-            if !postflop {
-                continue;
-            }
-            regret_matching(&e.regret, &mut s);
-            for (st, &p) in e.strat.iter_mut().zip(&s) {
+        let mut s = [0.0f64; MAX_ACTS];
+        self.nodes.for_each_postflop_mut(|regret, strat| {
+            regret_matching_into(regret, &mut s[..regret.len()]);
+            for (st, &p) in strat.iter_mut().zip(&s) {
                 *st += p;
             }
             n += 1;
-        }
+        });
         n
     }
 
     /// Normalized average strategy for an infoset, if visited.
     pub fn avg_strategy(&self, bucket: u16, hist: &[u8]) -> Option<Vec<f64>> {
-        let key = make_key(bucket, hist);
-        let node = self.nodes.get(&key)?;
-        normalize(&node.strat)
+        normalize(&self.nodes.strat(&make_key(bucket, hist))?)
     }
 
     /// Export the (much smaller) normalized average strategy for play.
     pub fn to_blueprint(&self) -> Blueprint {
         let mut strategies =
             StrategyMap::with_capacity_and_hasher(self.nodes.len(), Default::default());
-        for e in self.nodes.iter() {
-            if let Some(s) = normalize(&e.value().strat) {
-                strategies.insert(e.key().to_vec(), s.iter().map(|&x| x as f32).collect());
+        self.nodes.for_each(|key, _, strat| {
+            if let Some(s) = normalize(strat) {
+                strategies.insert(key.to_vec(), s.iter().map(|&x| x as f32).collect());
             }
-        }
+        });
         Blueprint {
             strategies,
             iterations: self.iterations(),
@@ -853,16 +1067,45 @@ impl Trainer {
 
     /// Resume from a checkpoint. The card abstraction (config + k-means
     /// centroids) is restored from the file so bucketing matches exactly.
+    /// The nodes stream into the table one by one: the whole list in memory
+    /// beside the table would double the peak.
     pub fn load_checkpoint(path: &str, cfg: TrainConfig) -> std::io::Result<Trainer> {
-        let f = std::io::BufReader::new(std::fs::File::open(path)?);
-        let ckpt: Checkpoint = bincode::deserialize_from(f).map_err(std::io::Error::other)?;
-        let abs = Abstraction::with_centroids(ckpt.abs_cfg, ckpt.centroids);
-        let t = Trainer::new(Arc::new(abs), cfg);
-        for (k, n) in ckpt.nodes {
-            t.nodes.insert(k.into_boxed_slice(), n);
+        fn next<T: serde::de::DeserializeOwned>(f: impl std::io::Read) -> std::io::Result<T> {
+            bincode::deserialize_from(f).map_err(std::io::Error::other)
         }
-        t.iters_done.store(ckpt.iterations, Ordering::Relaxed);
+        let mut f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+        let iterations: u64 = next(&mut f)?;
+        let abs_cfg: AbsConfig = next(&mut f)?;
+        let centroids: Option<Centroids> = next(&mut f)?;
+        let len: u64 = next(&mut f)?;
+        let t = Trainer::new(Arc::new(Abstraction::with_centroids(abs_cfg, centroids)), cfg);
+        t.nodes.reserve(len as usize);
+        for _ in 0..len {
+            let (key, node): (Vec<u8>, Node) = next(&mut f)?;
+            t.nodes.insert(&key, &node.regret, &node.strat);
+        }
+        t.iters_done.store(iterations, Ordering::Relaxed);
         Ok(t)
+    }
+
+    /// Writes the blueprint [`Trainer::to_blueprint`] builds, streamed from
+    /// the nodes: built in memory, a 205M-infoset blueprint takes ~20 GB on
+    /// top of the trainer. Returns the number of strategies.
+    pub fn save_blueprint(&self, path: &str) -> std::io::Result<usize> {
+        use std::io::Write;
+        let mut strategies = 0;
+        self.nodes.for_each(|_, _, strat| strategies += usize::from(strat.iter().sum::<f64>() > 0.0));
+        let bp = BlueprintRef {
+            strategies: StrategiesRef { nodes: &self.nodes, len: strategies },
+            iterations: self.iterations(),
+            num_players: self.cfg.hand.num_players,
+            abs_cfg: &self.abs.cfg,
+            centroids: &self.abs.centroids,
+        };
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        bincode::serialize_into(&mut f, &bp).map_err(std::io::Error::other)?;
+        f.flush()?;
+        Ok(strategies)
     }
 }
 
@@ -885,15 +1128,8 @@ struct LegacyBlueprint {
     centroids: Option<Centroids>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    iterations: u64,
-    abs_cfg: AbsConfig,
-    centroids: Option<Centroids>,
-    nodes: Vec<(Vec<u8>, Node)>,
-}
-
-/// Serializes exactly like [`Checkpoint`], borrowing the trainer's state.
+/// A checkpoint on disk: the iterations, the abstraction, then the nodes as a
+/// list of (key, [`Node`]) pairs, every value f64 whatever the table holds.
 #[derive(Serialize)]
 struct CheckpointRef<'a> {
     iterations: u64,
@@ -902,17 +1138,43 @@ struct CheckpointRef<'a> {
     nodes: NodesRef<'a>,
 }
 
-/// The node table as the `Vec<(Vec<u8>, Node)>` a checkpoint stores.
-struct NodesRef<'a>(&'a DashMap<InfoKey, Node, ahash::RandomState>);
+/// The node table as the list of (key, [`Node`]) pairs a checkpoint stores.
+struct NodesRef<'a>(&'a Nodes);
 
 impl Serialize for NodesRef<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = s.serialize_seq(Some(self.0.len()))?;
-        for e in self.0.iter() {
-            seq.serialize_element(&(&e.key()[..], e.value()))?;
-        }
+        self.0.try_for_each(|key, regret, strat| seq.serialize_element(&(key, (regret, strat))))?;
         seq.end()
+    }
+}
+
+/// Serializes exactly like [`Blueprint`], its strategies read off a trainer's nodes.
+#[derive(Serialize)]
+struct BlueprintRef<'a> {
+    strategies: StrategiesRef<'a>,
+    iterations: u64,
+    num_players: usize,
+    abs_cfg: &'a AbsConfig,
+    centroids: &'a Option<Centroids>,
+}
+
+/// The [`StrategyMap`] of the `len` nodes with a strategy.
+struct StrategiesRef<'a> {
+    nodes: &'a Nodes,
+    len: usize,
+}
+
+impl Serialize for StrategiesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.len))?;
+        self.nodes.try_for_each(|key, _, strat| match normalize(strat) {
+            Some(p) => map.serialize_entry(key, &p.iter().map(|&x| x as f32).collect::<Vec<f32>>()),
+            None => Ok(()),
+        })?;
+        map.end()
     }
 }
 
@@ -1373,23 +1635,19 @@ mod tests {
         let mut t = push_fold_trainer();
         t.cfg.snapshot_avg = true;
         t.run(20_000, &|_| {});
-        let postflop_before = t
-            .nodes
-            .iter()
-            .filter(|e| e.key()[2..].contains(&TOKEN_STREET_SEP))
-            .filter(|e| e.strat.iter().any(|&x| x != 0.0))
-            .count();
+        let mut postflop_before = 0;
+        t.nodes.for_each(|key, _, strat| {
+            postflop_before += usize::from(is_postflop(key) && strat.iter().any(|&x| x != 0.0));
+        });
         assert_eq!(postflop_before, 0, "postflop strat accumulated without a snapshot");
         let aa = preflop_bucket([make_card(12, 0), make_card(12, 1)]);
         assert!(t.avg_strategy(aa, &[]).is_some(), "preflop running average missing");
         let n = t.snapshot_strategy();
         assert!(n > 0);
-        let postflop_after = t
-            .nodes
-            .iter()
-            .filter(|e| e.key()[2..].contains(&TOKEN_STREET_SEP))
-            .filter(|e| normalize(&e.strat).is_some())
-            .count();
+        let mut postflop_after = 0;
+        t.nodes.for_each(|key, _, strat| {
+            postflop_after += usize::from(is_postflop(key) && normalize(strat).is_some());
+        });
         assert_eq!(postflop_after, n);
     }
 
@@ -1401,13 +1659,9 @@ mod tests {
         let h = Hand::new(&t.cfg.hand, 0, fresh_deck());
         t.run_subgame(&h, &[], 5_000, 2_000, None);
         assert!(t.node_count() > 0);
-        for e in t.nodes.iter() {
-            assert!(
-                e.value().regret.iter().all(|&r| r >= 0.0),
-                "CFR+ regrets must be nonnegative, got {:?}",
-                e.value().regret
-            );
-        }
+        t.nodes.for_each(|_, regret, _| {
+            assert!(regret.iter().all(|&r| r >= 0.0), "CFR+ regrets must be nonnegative, got {regret:?}");
+        });
     }
 
     #[test]
@@ -1436,9 +1690,9 @@ mod tests {
         assert_eq!(t2.iterations(), iters_before + 500);
 
         let bp = t.to_blueprint();
-        bp.save(bp_s).unwrap();
+        assert_eq!(t.save_blueprint(bp_s).unwrap(), bp.strategies.len());
         let bp2 = Blueprint::load(bp_s).unwrap();
-        assert_eq!(bp.strategies.len(), bp2.strategies.len());
+        assert_eq!(bp.strategies, bp2.strategies);
         assert_eq!(bp2.num_players, 2);
         assert_eq!(bp2.abs_cfg.postflop_buckets, 6);
         assert_eq!(bp2.centroids, t.abs.centroids);
