@@ -11,6 +11,7 @@
 use crate::abstraction::{AbsAction, AbsConfig, Abstraction, Centroids, TOKEN_LEAF, TOKEN_STREET_SEP};
 use crate::cards::fresh_deck;
 use crate::engine::{Hand, HandConfig, PlayerAction, Street, MAX_PLAYERS};
+use crate::record::{Arena, Record};
 use dashmap::DashMap;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
@@ -18,7 +19,6 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use hashbrown::HashTable;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -39,8 +39,14 @@ pub struct Node {
 /// boxed key beside two `Vec<f64>` that tree took ~150 B a node, past what a 48 GB machine holds
 /// beside the live server.
 pub struct Nodes {
-    shards: Box<[RwLock<HashTable<Record>>]>,
+    shards: Box<[RwLock<Shard>]>,
     hasher: ahash::RandomState,
+}
+
+/// A shard's table and the arena its records live in.
+struct Shard {
+    table: HashTable<NodeRecord>,
+    arena: Arena,
 }
 
 /// `Nodes` has 2^SHARD_BITS shards.
@@ -50,99 +56,49 @@ fn is_postflop(key: &[u8]) -> bool {
     key.len() > 2 && key[2..].contains(&TOKEN_STREET_SEP)
 }
 
-/// A node as one allocation behind a thin pointer: the key's length (u16 LE), the action count
-/// (u8), the key, the regrets as f32 LE, then the strategy sums as f64 LE.
-struct Record(std::ptr::NonNull<u8>);
+/// A trainer node's values: its regrets as f32, then its strategy sums as f64.
+type NodeRecord = Record<12>;
 
-// A Record owns its allocation, like the Box<[u8]> it was made from.
-unsafe impl Send for Record {}
-unsafe impl Sync for Record {}
-
-impl Record {
-    fn size(key_len: usize, actions: usize) -> usize {
-        3 + key_len + 12 * actions
-    }
-
-    fn new(key: &[u8], regret: &[f64], strat: &[f64]) -> Record {
-        let n = regret.len();
-        let mut r = Vec::with_capacity(Record::size(key.len(), n));
-        r.extend_from_slice(&(key.len() as u16).to_le_bytes());
-        r.push(n as u8);
-        r.extend_from_slice(key);
-        for &x in regret {
-            r.extend_from_slice(&(x as f32).to_le_bytes());
-        }
-        for &x in strat {
-            r.extend_from_slice(&x.to_le_bytes());
-        }
-        let raw = Box::into_raw(r.into_boxed_slice()) as *mut u8;
-        Record(std::ptr::NonNull::new(raw).expect("Box is never null"))
-    }
-
-    fn bytes(&self) -> &[u8] {
-        let p = self.0.as_ptr();
-        // SAFETY: `p` heads a live allocation of `Record::size` bytes, read off its own header.
-        unsafe {
-            let size = Record::size(u16::from_le_bytes([*p, *p.add(1)]) as usize, *p.add(2) as usize);
-            std::slice::from_raw_parts(p, size)
-        }
-    }
-
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        let size = self.bytes().len();
-        // SAFETY: as in `bytes`, and `&mut self` makes the access unique.
-        unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), size) }
-    }
-
-    fn key(&self) -> &[u8] {
-        let b = self.bytes();
-        &b[3..3 + u16::from_le_bytes([b[0], b[1]]) as usize]
-    }
-
-    fn actions(&self) -> usize {
-        self.bytes()[2] as usize
+impl NodeRecord {
+    fn node(arena: &mut Arena, key: &[u8], regret: &[f64], strat: &[f64]) -> NodeRecord {
+        let mut r = Record::new_in(arena, key, regret.len());
+        let values: Vec<f64> = regret.iter().chain(strat).copied().collect();
+        r.write(&values);
+        r
     }
 
     /// The regrets then the strategy sums into `out` (twice the action count long).
     fn read(&self, out: &mut [f64]) {
-        let b = self.bytes();
-        let n = b[2] as usize;
-        let at = 3 + u16::from_le_bytes([b[0], b[1]]) as usize;
-        let (regret, strat) = out.split_at_mut(n);
-        for (o, c) in regret.iter_mut().zip(b[at..at + 4 * n].as_chunks::<4>().0) {
-            *o = f32::from_le_bytes(*c) as f64;
+        let n = self.actions();
+        let (regret, strat) = self.values().split_at(4 * n);
+        let (regret_out, strat_out) = out.split_at_mut(n);
+        for (o, c) in regret_out.iter_mut().zip(regret.as_chunks::<4>().0) {
+            *o = f32::from_ne_bytes(*c) as f64;
         }
-        for (o, c) in strat.iter_mut().zip(b[at + 4 * n..].as_chunks::<8>().0) {
-            *o = f64::from_le_bytes(*c);
+        for (o, c) in strat_out.iter_mut().zip(strat.as_chunks::<8>().0) {
+            *o = f64::from_ne_bytes(*c);
         }
     }
 
     fn write(&mut self, values: &[f64]) {
-        let b = self.bytes_mut();
-        let n = b[2] as usize;
-        let at = 3 + u16::from_le_bytes([b[0], b[1]]) as usize;
+        let n = self.actions();
         let (regret, strat) = values.split_at(n);
-        for (c, &x) in b[at..at + 4 * n].as_chunks_mut::<4>().0.iter_mut().zip(regret) {
-            c.copy_from_slice(&(x as f32).to_le_bytes());
+        let (regret_out, strat_out) = self.values_mut().split_at_mut(4 * n);
+        for (c, &x) in regret_out.as_chunks_mut::<4>().0.iter_mut().zip(regret) {
+            *c = (x as f32).to_ne_bytes();
         }
-        for (c, &x) in b[at + 4 * n..].as_chunks_mut::<8>().0.iter_mut().zip(strat) {
-            c.copy_from_slice(&x.to_le_bytes());
+        for (c, &x) in strat_out.as_chunks_mut::<8>().0.iter_mut().zip(strat) {
+            *c = x.to_ne_bytes();
         }
-    }
-}
-
-impl Drop for Record {
-    fn drop(&mut self) {
-        let bytes: *mut [u8] = self.bytes_mut();
-        // SAFETY: the allocation came from `Box::into_raw` of a `Box<[u8]>` this long.
-        drop(unsafe { Box::from_raw(bytes) });
     }
 }
 
 impl Nodes {
     fn new() -> Self {
         Nodes {
-            shards: (0..1usize << SHARD_BITS).map(|_| RwLock::new(HashTable::new())).collect(),
+            shards: (0..1usize << SHARD_BITS)
+                .map(|_| RwLock::new(Shard { table: HashTable::new(), arena: Arena::new() }))
+                .collect(),
             hasher: ahash::RandomState::new(),
         }
     }
@@ -152,12 +108,12 @@ impl Nodes {
     }
 
     /// The shard below the hash's top 7 bits, which the table keeps for its control bytes.
-    fn shard(&self, hash: u64) -> &RwLock<HashTable<Record>> {
+    fn shard(&self, hash: u64) -> &RwLock<Shard> {
         &self.shards[((hash << 7) >> (64 - SHARD_BITS)) as usize]
     }
 
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.read().unwrap().len()).sum()
+        self.shards.iter().map(|s| s.read().unwrap().table.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -168,8 +124,8 @@ impl Nodes {
     fn reserve(&self, n: usize) {
         let per_shard = n >> SHARD_BITS;
         for shard in self.shards.iter() {
-            let mut t = shard.write().unwrap();
-            t.reserve(per_shard + per_shard / 32 + 64, |r| self.hash(r.key()));
+            let mut s = shard.write().unwrap();
+            s.table.reserve(per_shard + per_shard / 32 + 64, |r| self.hash(r.key()));
         }
     }
 
@@ -180,20 +136,22 @@ impl Nodes {
         let hash = self.hash(key);
         let shard = self.shard(hash);
         let mut values = [0.0f64; 2 * MAX_ACTS];
-        if let Some(r) = shard.read().unwrap().find(hash, |r| r.key() == key) {
+        if let Some(r) = shard.read().unwrap().table.find(hash, |r| r.key() == key) {
             r.read(&mut values[..2 * n]);
             out.copy_from_slice(&values[..n]);
             return;
         }
-        let mut t = shard.write().unwrap();
-        match t.find(hash, |r| r.key() == key) {
+        let mut s = shard.write().unwrap();
+        let Shard { table, arena } = &mut *s;
+        match table.find(hash, |r| r.key() == key) {
             Some(r) => {
                 r.read(&mut values[..2 * n]);
                 out.copy_from_slice(&values[..n]);
             }
             None => {
                 let zero = &values[..n];
-                t.insert_unique(hash, Record::new(key, zero, zero), |r| self.hash(r.key()));
+                let fresh = NodeRecord::node(arena, key, zero, zero);
+                table.insert_unique(hash, fresh, |r| self.hash(r.key()));
                 out.fill(0.0);
             }
         }
@@ -202,8 +160,8 @@ impl Nodes {
     /// Runs `f` on `key`'s regrets and strategy sums, when the node exists.
     fn update(&self, key: &[u8], f: impl FnOnce(&mut [f64], &mut [f64])) {
         let hash = self.hash(key);
-        let mut t = self.shard(hash).write().unwrap();
-        if let Some(r) = t.find_mut(hash, |r| r.key() == key) {
+        let mut s = self.shard(hash).write().unwrap();
+        if let Some(r) = s.table.find_mut(hash, |r| r.key() == key) {
             let n = r.actions();
             let mut values = [0.0f64; 2 * MAX_ACTS];
             r.read(&mut values[..2 * n]);
@@ -215,12 +173,13 @@ impl Nodes {
 
     fn insert(&self, key: &[u8], regret: &[f64], strat: &[f64]) {
         let hash = self.hash(key);
-        let mut t = self.shard(hash).write().unwrap();
-        let fresh = Record::new(key, regret, strat);
-        match t.find_mut(hash, |r| r.key() == key) {
+        let mut s = self.shard(hash).write().unwrap();
+        let Shard { table, arena } = &mut *s;
+        let fresh = NodeRecord::node(arena, key, regret, strat);
+        match table.find_mut(hash, |r| r.key() == key) {
             Some(r) => *r = fresh,
             None => {
-                t.insert_unique(hash, fresh, |r| self.hash(r.key()));
+                table.insert_unique(hash, fresh, |r| self.hash(r.key()));
             }
         }
     }
@@ -228,8 +187,8 @@ impl Nodes {
     /// `key`'s strategy sums, if visited.
     fn strat(&self, key: &[u8]) -> Option<Vec<f64>> {
         let hash = self.hash(key);
-        let t = self.shard(hash).read().unwrap();
-        let r = t.find(hash, |r| r.key() == key)?;
+        let s = self.shard(hash).read().unwrap();
+        let r = s.table.find(hash, |r| r.key() == key)?;
         let mut values = vec![0.0; 2 * r.actions()];
         r.read(&mut values);
         Some(values.split_off(r.actions()))
@@ -239,7 +198,7 @@ impl Nodes {
     fn try_for_each<E>(&self, mut f: impl FnMut(&[u8], &[f64], &[f64]) -> Result<(), E>) -> Result<(), E> {
         let mut values = [0.0f64; 2 * MAX_ACTS];
         for shard in self.shards.iter() {
-            for r in shard.read().unwrap().iter() {
+            for r in shard.read().unwrap().table.iter() {
                 let n = r.actions();
                 r.read(&mut values[..2 * n]);
                 let (regret, strat) = values[..2 * n].split_at(n);
@@ -265,7 +224,7 @@ impl Nodes {
     fn for_each_mut_where(&self, keep: impl Fn(&[u8]) -> bool, mut f: impl FnMut(&mut [f64], &mut [f64])) {
         let mut values = [0.0f64; 2 * MAX_ACTS];
         for shard in self.shards.iter() {
-            for r in shard.write().unwrap().iter_mut() {
+            for r in shard.write().unwrap().table.iter_mut() {
                 if !keep(r.key()) {
                     continue;
                 }
@@ -1038,11 +997,10 @@ impl Trainer {
 
     /// Export the (much smaller) normalized average strategy for play.
     pub fn to_blueprint(&self) -> Blueprint {
-        let mut strategies =
-            StrategyMap::with_capacity_and_hasher(self.nodes.len(), Default::default());
+        let mut strategies = StrategyMap::with_capacity(self.nodes.len());
         self.nodes.for_each(|key, _, strat| {
             if let Some(s) = normalize(strat) {
-                strategies.insert(key.to_vec(), s.iter().map(|&x| x as f32).collect());
+                strategies.insert(key, &s.iter().map(|&x| x as f32).collect::<Vec<f32>>());
             }
         });
         Blueprint {
@@ -1242,10 +1200,129 @@ pub fn sample_index(probs: &[f64], rng: &mut SmallRng) -> usize {
     probs.len() - 1
 }
 
-/// Strategy store keyed by (bucket, history) bytes. ahash: `get` runs on
-/// every decision of every hand everywhere, and the wire format (len +
-/// entries) is hasher-independent, so existing .bin files stay compatible.
-pub type StrategyMap = HashMap<Vec<u8>, Vec<f32>, ahash::RandomState>;
+/// Strategy store keyed by (bucket, history) bytes: each infoset one [`Record`] of f32
+/// probabilities behind a thin pointer. As a map of `Vec<u8>` to `Vec<f32>` the 172M-infoset
+/// blueprint took 18 GB in the live server. It serializes as that map did (len + entries), so
+/// existing .bin files load as they are. ahash: `get` runs on every decision of every hand.
+pub struct StrategyMap {
+    table: HashTable<Record<4>>,
+    arena: Arena,
+    hasher: ahash::RandomState,
+}
+
+impl StrategyMap {
+    pub fn with_capacity(n: usize) -> Self {
+        StrategyMap { table: HashTable::with_capacity(n), arena: Arena::new(), hasher: ahash::RandomState::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<&[f32]> {
+        let hash = self.hasher.hash_one(key);
+        self.table.find(hash, |r| r.key() == key).map(|r| r.floats())
+    }
+
+    /// `key`'s probabilities, in place of any it had.
+    pub fn insert(&mut self, key: &[u8], probs: &[f32]) {
+        let StrategyMap { table, arena, hasher } = self;
+        let hash = hasher.hash_one(key);
+        let mut fresh = Record::new_in(arena, key, probs.len());
+        fresh.floats_mut().copy_from_slice(probs);
+        match table.find_mut(hash, |r| r.key() == key) {
+            Some(r) => *r = fresh,
+            None => {
+                table.insert_unique(hash, fresh, |r| hasher.hash_one(r.key()));
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[f32])> {
+        self.table.iter().map(|r| (r.key(), r.floats()))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.table.iter().map(|r| r.key())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &[f32]> {
+        self.table.iter().map(|r| r.floats())
+    }
+}
+
+impl Default for StrategyMap {
+    fn default() -> Self {
+        StrategyMap::with_capacity(0)
+    }
+}
+
+impl Clone for StrategyMap {
+    fn clone(&self) -> Self {
+        let mut copy = StrategyMap::with_capacity(self.len());
+        for (key, probs) in self.iter() {
+            copy.insert(key, probs);
+        }
+        copy
+    }
+}
+
+impl PartialEq for StrategyMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|(key, probs)| other.get(key) == Some(probs))
+    }
+}
+
+impl std::fmt::Debug for StrategyMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StrategyMap({} infosets)", self.len())
+    }
+}
+
+impl FromIterator<(Vec<u8>, Vec<f32>)> for StrategyMap {
+    fn from_iter<I: IntoIterator<Item = (Vec<u8>, Vec<f32>)>>(entries: I) -> Self {
+        let mut map = StrategyMap::default();
+        for (key, probs) in entries {
+            map.insert(&key, &probs);
+        }
+        map
+    }
+}
+
+impl Serialize for StrategyMap {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.len()))?;
+        for (key, probs) in self.iter() {
+            map.serialize_entry(key, probs)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StrategyMap {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = StrategyMap;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of infoset keys to probabilities")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut entries: A) -> Result<StrategyMap, A::Error> {
+                let mut map = StrategyMap::with_capacity(entries.size_hint().unwrap_or(0));
+                while let Some((key, probs)) = entries.next_entry::<Vec<u8>, Vec<f32>>()? {
+                    map.insert(&key, &probs);
+                }
+                Ok(map)
+            }
+        }
+        d.deserialize_map(Entries)
+    }
+}
 
 /// The trained average strategy used at the table, together with the card
 /// abstraction it was trained under (config + k-means centroids), so play
@@ -1260,9 +1337,8 @@ pub struct Blueprint {
 }
 
 impl Blueprint {
-    pub fn get(&self, bucket: u16, hist: &[u8]) -> Option<&Vec<f32>> {
-        let key = make_key(bucket, hist);
-        self.strategies.get(key.as_ref() as &[u8])
+    pub fn get(&self, bucket: u16, hist: &[u8]) -> Option<&[f32]> {
+        self.strategies.get(&make_key(bucket, hist))
     }
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {

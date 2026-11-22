@@ -455,10 +455,7 @@ finishing_stacks = [10325, 9900, 10000, 10000, 9775, 10000]
         let mut strategies = crate::cfr::StrategyMap::default();
         let mut s = vec![0.0f32; n_acts];
         s[0] = 1.0; // always fold
-        strategies.insert(
-            make_key(bucket, &[crate::abstraction::AbsAction::Fold.token()]).to_vec(),
-            s,
-        );
+        strategies.insert(&make_key(bucket, &[crate::abstraction::AbsAction::Fold.token()]), &s);
         let bp = Blueprint {
             strategies,
             iterations: 1,

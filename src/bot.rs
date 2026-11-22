@@ -700,7 +700,7 @@ mod tests {
         let mut strategies = crate::cfr::StrategyMap::default();
         let mut probs = vec![0.0f32; acts.len()];
         probs[0] = 1.0; // Fold is always first when facing a bet
-        strategies.insert(make_key(bucket, &[]).to_vec(), probs);
+        strategies.insert(&make_key(bucket, &[]), &probs);
         let bp = Blueprint {
             strategies,
             iterations: 1,
@@ -731,7 +731,7 @@ mod tests {
         // Stored strategy has one FEWER action than the current menu — the
         // signature of a blueprint trained with a narrower bet menu.
         let mut strategies = crate::cfr::StrategyMap::default();
-        strategies.insert(make_key(bucket, &[]).to_vec(), vec![0.5f32; acts.len() - 1]);
+        strategies.insert(&make_key(bucket, &[]), &vec![0.5f32; acts.len() - 1]);
         let bp = Blueprint {
             strategies,
             iterations: 1,

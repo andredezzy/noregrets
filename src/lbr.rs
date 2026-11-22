@@ -773,7 +773,7 @@ mod tests {
             } else {
                 s[0] = 1.0;
             }
-            strategies.insert(make_key(bucket, &[]).to_vec(), s);
+            strategies.insert(&make_key(bucket, &[]), &s);
         }
         let policy = Policy::new(
             Blueprint {

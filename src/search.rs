@@ -287,7 +287,7 @@ mod tests {
             } else {
                 s[1] = 1.0; // check/call
             }
-            strategies.insert(make_key(bucket, &[]).to_vec(), s);
+            strategies.insert(&make_key(bucket, &[]), &s);
         }
         let bp = Blueprint {
             strategies,
@@ -355,7 +355,7 @@ mod tests {
             } else {
                 s[0] = 1.0; // everything else folds
             }
-            strategies.insert(make_key(bucket, &[]).to_vec(), s);
+            strategies.insert(&make_key(bucket, &[]), &s);
         }
         let bp = Blueprint {
             strategies,

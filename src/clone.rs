@@ -147,7 +147,7 @@ pub fn build(
 ) -> Result<(Blueprint, CloneStats), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut stats = CloneStats::default();
-    let mut counts: StrategyMap = StrategyMap::default();
+    let mut counts: std::collections::HashMap<Vec<u8>, Vec<f32>> = Default::default();
     let mut held: Vec<Decision> = Vec::new();
 
     for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
@@ -212,7 +212,7 @@ pub fn build(
             .min(3);
         let slot = &mut stats.agree[street];
         slot.1 += 1;
-        if let Some(probs) = counts.get(&d.key[..].to_vec()) {
+        if let Some(probs) = counts.get(&d.key[..]) {
             let best = probs
                 .iter()
                 .enumerate()
@@ -225,7 +225,7 @@ pub fn build(
     }
 
     let bp = Blueprint {
-        strategies: counts,
+        strategies: counts.into_iter().collect::<StrategyMap>(),
         iterations: stats.decisions,
         num_players: 2,
         abs_cfg: abs.cfg.clone(),

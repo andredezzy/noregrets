@@ -176,7 +176,7 @@ pub fn merge(mut bp: Blueprint, records: &Records, alpha: f64) -> (Blueprint, u6
             }
             None => mean.iter().map(|&m| m as f32).collect(),
         };
-        bp.strategies.insert(e.key().clone(), blended);
+        bp.strategies.insert(e.key(), &blended);
         updated += 1;
     }
     (bp, updated, skipped)
@@ -197,9 +197,9 @@ mod tests {
     fn merge_blends_inserts_and_skips_mismatches() {
         let mut strategies = crate::cfr::StrategyMap::default();
         // Existing key, matching length, unnormalized on purpose.
-        strategies.insert(vec![1u8], vec![3.0f32, 1.0]); // normalizes to .75/.25
+        strategies.insert(&[1u8], &[3.0f32, 1.0]); // normalizes to .75/.25
         // Existing key whose stored menu length differs from the record.
-        strategies.insert(vec![2u8], vec![1.0f32, 1.0, 1.0]);
+        strategies.insert(&[2u8], &[1.0f32, 1.0, 1.0]);
         let old = Blueprint {
             strategies,
             iterations: 7,
@@ -218,13 +218,13 @@ mod tests {
         let (bp, updated, skipped) = merge(old, &records, 0.5);
         assert_eq!(updated, 2);
         assert_eq!(skipped, 1, "length mismatches are skipped, never overwritten");
-        let s1 = &bp.strategies[&vec![1u8]];
+        let s1 = bp.strategies.get(&[1u8]).unwrap();
         assert!((s1[0] - 0.5).abs() < 1e-6, "0.5·0.75 + 0.5·0.25 = 0.5, got {}", s1[0]);
         assert!((s1[1] - 0.5).abs() < 1e-6);
-        let s2 = &bp.strategies[&vec![2u8]];
+        let s2 = bp.strategies.get(&[2u8]).unwrap();
         assert_eq!(s2.len(), 3, "mismatched entry must be left intact");
         assert_eq!(s2[0], 1.0f32);
-        let s3 = &bp.strategies[&vec![3u8]];
+        let s3 = bp.strategies.get(&[3u8]).unwrap();
         assert!((s3[0] - 0.6).abs() < 1e-6);
         // Metadata preserved.
         assert_eq!(bp.iterations, 7);
@@ -307,7 +307,7 @@ mod tests {
         // Every recorded key's entry is a valid distribution of the same
         // length as the record (nothing corrupted by menu mismatch).
         for e in records.iter() {
-            let s = &bp2.strategies[e.key()];
+            let s = bp2.strategies.get(e.key()).unwrap();
             assert_eq!(s.len(), e.value().0.len());
             let total: f32 = s.iter().sum();
             assert!((total - 1.0).abs() < 1e-3, "must normalize, got {total}");

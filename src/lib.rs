@@ -16,6 +16,7 @@ pub mod lbr;
 pub mod net;
 pub mod play;
 pub mod portfolio;
+mod record;
 pub mod river;
 pub mod search;
 pub mod slumbot;
