@@ -553,7 +553,12 @@ fn main() {
                         t.iterations(),
                         t.node_count()
                     );
-                    t
+                    // A resumed run may switch to RNR (a self-play checkpoint continued against a model).
+                    let rnr = rnr_model.map(|model| {
+                        println!("RNR training: model {model:?}, p = {rnr_p}, rake {rake_bp} bp");
+                        pluribus::cfr::RnrCfg { model, p: rnr_p }
+                    });
+                    t.with_rnr(rnr)
                 }
                 None if rnr_opponent.is_some() => {
                     let path = rnr_opponent.as_ref().unwrap();
