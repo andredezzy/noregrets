@@ -476,6 +476,19 @@ enum Cmd {
         #[arg(long, default_value_t = 0.1)]
         holdout: f64,
     },
+    /// Write the blueprint of a training checkpoint, reading it from disk instead of loading it.
+    Export {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value_t = 6)]
+        players: usize,
+        /// Nodes with no strategy sums play their current strategy (regret matching), where some
+        /// regret is positive: the lines only an RNR model's opponents reach.
+        #[arg(long)]
+        fill_current: bool,
+    },
     /// Print blueprint statistics.
     Inspect {
         #[arg(long, default_value = "blueprint.bin")]
@@ -1282,6 +1295,12 @@ fn main() {
             bp.save(&out)
                 .unwrap_or_else(|e| die(&format!("cannot save {out}: {e}")));
             println!("saved clone to {out}");
+        }
+
+        Cmd::Export { checkpoint, out, players, fill_current } => {
+            let strategies = pluribus::cfr::blueprint_from_checkpoint(&checkpoint, players, fill_current, &out)
+                .unwrap_or_else(|e| die(&format!("cannot export {checkpoint}: {e}")));
+            println!("blueprint saved to {out} ({strategies} strategies)");
         }
 
         Cmd::Inspect { blueprint } => {

@@ -1096,6 +1096,67 @@ struct LegacyBlueprint {
     centroids: Option<Centroids>,
 }
 
+/// Writes the blueprint of a checkpoint's nodes to `out`, reading the checkpoint twice instead of
+/// loading it: a 1.92B-iteration RNR checkpoint holds ~480M nodes, past what the machine that
+/// trained it holds in memory. With `fill_current`, a node with no strategy sums plays its current
+/// strategy (regret matching) when some regret is positive: RNR traversals against the model add
+/// to no average, so the lines only the model's opponents reach (300M of those nodes, against
+/// Brasa's) have regrets alone. Returns the number of strategies.
+pub fn blueprint_from_checkpoint(
+    checkpoint: &str,
+    num_players: usize,
+    fill_current: bool,
+    out: &str,
+) -> std::io::Result<usize> {
+    use std::io::Write;
+    fn next<T: serde::de::DeserializeOwned>(f: impl std::io::Read) -> std::io::Result<T> {
+        bincode::deserialize_from(f).map_err(std::io::Error::other)
+    }
+    fn put<T: Serialize + ?Sized>(f: impl Write, value: &T) -> std::io::Result<()> {
+        bincode::serialize_into(f, value).map_err(std::io::Error::other)
+    }
+    let open = || -> std::io::Result<_> {
+        let mut f = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(checkpoint)?);
+        let iterations: u64 = next(&mut f)?;
+        let abs_cfg: AbsConfig = next(&mut f)?;
+        let centroids: Option<Centroids> = next(&mut f)?;
+        let len: u64 = next(&mut f)?;
+        Ok((f, iterations, abs_cfg, centroids, len))
+    };
+    let strategy = |node: &Node| -> Option<Vec<f64>> {
+        normalize(&node.strat).or_else(|| {
+            let positive = fill_current && node.regret.iter().any(|&r| r > 0.0);
+            positive.then(|| {
+                let mut s = Vec::new();
+                regret_matching(&node.regret, &mut s);
+                s
+            })
+        })
+    };
+    let (mut f, _, _, _, len) = open()?;
+    let mut strategies = 0usize;
+    for _ in 0..len {
+        let (_, node): (Vec<u8>, Node) = next(&mut f)?;
+        strategies += usize::from(strategy(&node).is_some());
+    }
+    let (mut f, iterations, abs_cfg, centroids, len) = open()?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out)?);
+    put(&mut w, &(strategies as u64))?;
+    for _ in 0..len {
+        let (key, node): (Vec<u8>, Node) = next(&mut f)?;
+        if let Some(p) = strategy(&node) {
+            put(&mut w, &key)?;
+            put(&mut w, &p.iter().map(|&x| x as f32).collect::<Vec<f32>>())?;
+        }
+    }
+    put(&mut w, &iterations)?;
+    put(&mut w, &num_players)?;
+    put(&mut w, &abs_cfg)?;
+    put(&mut w, &centroids)?;
+    w.flush()?;
+    Ok(strategies)
+}
+
 /// A checkpoint on disk: the iterations, the abstraction, then the nodes as a
 /// list of (key, [`Node`]) pairs, every value f64 whatever the table holds.
 #[derive(Serialize)]
@@ -1779,6 +1840,9 @@ mod tests {
         assert_eq!(t.save_blueprint(bp_s).unwrap(), bp.strategies.len());
         let bp2 = Blueprint::load(bp_s).unwrap();
         assert_eq!(bp.strategies, bp2.strategies);
+        assert_eq!(blueprint_from_checkpoint(ckpt_s, 2, false, bp_s).unwrap(), bp.strategies.len());
+        let bp3 = Blueprint::load(bp_s).unwrap();
+        assert_eq!((&bp3.strategies, bp3.iterations, bp3.num_players), (&bp.strategies, iters_before, 2));
         assert_eq!(bp2.num_players, 2);
         assert_eq!(bp2.abs_cfg.postflop_buckets, 6);
         assert_eq!(bp2.centroids, t.abs.centroids);
