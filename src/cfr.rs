@@ -256,12 +256,17 @@ impl Nodes {
         });
     }
 
-    /// Every postflop node's regrets and strategy sums, for `f` to change.
-    fn for_each_postflop_mut(&self, mut f: impl FnMut(&mut [f64], &mut [f64])) {
+    /// Every node's regrets and strategy sums, for `f` to change.
+    fn for_each_mut(&self, f: impl FnMut(&mut [f64], &mut [f64])) {
+        self.for_each_mut_where(|_| true, f);
+    }
+
+    /// Every node whose key passes `keep`, its regrets and strategy sums for `f` to change.
+    fn for_each_mut_where(&self, keep: impl Fn(&[u8]) -> bool, mut f: impl FnMut(&mut [f64], &mut [f64])) {
         let mut values = [0.0f64; 2 * MAX_ACTS];
         for shard in self.shards.iter() {
             for r in shard.write().unwrap().iter_mut() {
-                if !is_postflop(r.key()) {
+                if !keep(r.key()) {
                     continue;
                 }
                 let n = r.actions();
@@ -1004,6 +1009,11 @@ impl Trainer {
         h.utilities()[traverser] as f64
     }
 
+    /// Scales every infoset's strategy sums by `factor` (see `train --strat-discount`).
+    pub fn discount_strategy(&self, factor: f64) {
+        self.nodes.for_each_mut(|_, strat| strat.iter_mut().for_each(|s| *s *= factor));
+    }
+
     /// Snapshot mode: add every postflop infoset's current regret-matching
     /// strategy into its `strat` accumulator. Called periodically after a
     /// warm-up; the exported blueprint is the mean of the snapshots.
@@ -1011,7 +1021,7 @@ impl Trainer {
     pub fn snapshot_strategy(&self) -> usize {
         let mut n = 0;
         let mut s = [0.0f64; MAX_ACTS];
-        self.nodes.for_each_postflop_mut(|regret, strat| {
+        self.nodes.for_each_mut_where(is_postflop, |regret, strat| {
             regret_matching_into(regret, &mut s[..regret.len()]);
             for (st, &p) in strat.iter_mut().zip(&s) {
                 *st += p;
@@ -1705,6 +1715,21 @@ mod tests {
 
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(bp_path);
+    }
+
+    #[test]
+    fn a_strategy_discount_scales_every_sum_and_keeps_every_average() {
+        let t = push_fold_trainer();
+        t.run(2_000, &|_| {});
+        let mut before = Vec::new();
+        t.nodes.for_each(|key, _, strat| before.push((key.to_vec(), strat.to_vec())));
+        t.discount_strategy(0.1);
+        for (key, strat) in &before {
+            let after = t.nodes.strat(key).unwrap();
+            for (a, b) in after.iter().zip(strat) {
+                assert!((a - 0.1 * b).abs() <= 1e-9 * b.abs().max(1.0), "{a} vs 0.1 x {b}");
+            }
+        }
     }
 
     #[test]

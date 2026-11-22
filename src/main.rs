@@ -45,6 +45,15 @@ enum Cmd {
         /// Also write a training checkpoint here (enables later --resume).
         #[arg(long)]
         checkpoint: Option<String>,
+        /// Iterations between checkpoints. Default: every 5% of the run.
+        #[arg(long)]
+        checkpoint_every: Option<u64>,
+        /// On resume, scale every strategy sum by this factor, so the iterations to come weigh more
+        /// in the average strategy than the checkpoint's own. A run continued from 1.87B iterations
+        /// under a new objective (RNR, rake) otherwise holds the old average for most of its weight:
+        /// 75M more iterations reach ~7% of it, ~45% at 0.1.
+        #[arg(long, default_value_t = 1.0)]
+        strat_discount: f64,
         /// Postflop equity buckets per street.
         #[arg(long, default_value_t = 12)]
         buckets: u16,
@@ -493,6 +502,8 @@ fn main() {
             stack,
             resume,
             checkpoint,
+            checkpoint_every,
+            strat_discount,
             buckets,
             menu,
             rollouts,
@@ -553,6 +564,10 @@ fn main() {
                         t.iterations(),
                         t.node_count()
                     );
+                    if strat_discount != 1.0 {
+                        t.discount_strategy(strat_discount);
+                        println!("strategy sums scaled by {strat_discount}");
+                    }
                     // A resumed run may switch to RNR (a self-play checkpoint continued against a model).
                     let rnr = rnr_model.map(|model| {
                         println!("RNR training: model {model:?}, p = {rnr_p}, rake {rake_bp} bp");
@@ -666,7 +681,9 @@ fn main() {
 
             // Train in chunks so long runs checkpoint periodically (and so
             // snapshot mode can sample the current strategy every 5%).
-            let chunk = if checkpoint.is_some() || snapshot_avg {
+            let chunk = if let Some(every) = checkpoint_every {
+                every.max(1).min(iters)
+            } else if checkpoint.is_some() || snapshot_avg {
                 iters.div_ceil(20).max(100_000).min(iters)
             } else {
                 iters
