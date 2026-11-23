@@ -72,6 +72,7 @@ enum Cmd {
         /// Preloaded flop/turn bucket table from `bucket-table` (same
         /// buckets/rollouts/runouts): skips centroid training and the
         /// Monte Carlo bucketing that otherwise takes ~70% of training.
+        /// With --resume it must hold the checkpoint's own centroids.
         #[arg(long)]
         bucket_table: Option<String>,
         /// Situations sampled per street when training k-means centroids.
@@ -580,6 +581,18 @@ fn main() {
                     if strat_discount != 1.0 {
                         t.discount_strategy(strat_discount);
                         println!("strategy sums scaled by {strat_discount}");
+                    }
+                    if let Some(table_path) = &bucket_table {
+                        let table = pluribus::abstraction::BucketTable::load(table_path)
+                            .unwrap_or_else(|e| die(&format!("cannot load bucket table '{table_path}': {e}")));
+                        // WARNING: a table built from other centroids would hand every flop and turn hand the bucket of another clustering, silently.
+                        if !table.matches(&t.abs.cfg) || table.centroids != t.abs.centroids {
+                            die(&format!(
+                                "bucket table '{table_path}' was not built from {path}'s abstraction (its config or centroids differ)"
+                            ));
+                        }
+                        t.abs.prefill_canon(&table.entries);
+                        println!("loaded bucket table {table_path}: {} canonical flop/turn buckets", table.entries.len());
                     }
                     // A resumed run may switch to RNR (a self-play checkpoint continued against a model).
                     let rnr = rnr_model.map(|model| {
