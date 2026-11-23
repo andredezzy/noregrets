@@ -289,6 +289,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                model_p: None,
             },
             alpha: 0.5,
             seed: 42,

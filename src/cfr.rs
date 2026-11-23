@@ -388,7 +388,8 @@ pub struct Trainer {
     /// Model opponents as lambda-rational (logit QRE) instead of
     /// regret-matching at their nodes. Subgame-only exploitation knob.
     qre_lambda: Option<f64>,
-    /// Restricted Nash response mixture (blueprint training only).
+    /// Restricted Nash response mixture: blueprint training, and resolves in
+    /// the search's model mode (`SearchParams::model_p`).
     rnr: Option<RnrCfg>,
     /// Round-start rooting for subgame solves.
     spine: Option<Spine>,
@@ -620,6 +621,7 @@ impl Trainer {
     ) {
         let start = std::time::Instant::now();
         let n = root.num_players();
+        let hero = self.spine.as_ref().map_or(root.to_act(), |s| s.hero);
         while self.iterations() < max_iters
             && (start.elapsed().as_millis() as u64) < time_ms
         {
@@ -629,7 +631,9 @@ impl Trainer {
                 let t = t0 + j + 1;
                 let mut rng =
                     SmallRng::seed_from_u64(t.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xACE);
-                let traverser = (t % n as u64) as usize;
+                // RNR subgame: against the model only the hero learns, so the hero traverses.
+                let model_opp = self.rnr.as_ref().is_some_and(|r| rng.random::<f64>() < r.p);
+                let traverser = if model_opp { hero } else { (t % n as u64) as usize };
                 if root.folded(traverser) {
                     return;
                 }
@@ -639,7 +643,7 @@ impl Trainer {
                     None => h.resample_hidden(None, &mut rng),
                 }
                 let mut hist = root_hist.to_vec();
-                self.traverse(&h, &mut hist, traverser, t as f64, 1.0, false, false, &mut rng);
+                self.traverse(&h, &mut hist, traverser, t as f64, 1.0, false, model_opp, &mut rng);
             });
             self.iters_done.fetch_add(batch, Ordering::Relaxed);
         }
@@ -667,7 +671,7 @@ impl Trainer {
         }
         if let Some(lc) = &self.leaf {
             if h.street() > lc.limit {
-                return self.leaf_value(h, hist, traverser, weight, lc, rng);
+                return self.leaf_value(h, hist, traverser, weight, lc, model_opp, rng);
             }
         }
         let p = h.to_act();
@@ -909,11 +913,14 @@ impl Trainer {
         traverser: usize,
         weight: f64,
         lc: &LeafCfg,
+        model_opp: bool,
         rng: &mut SmallRng,
     ) -> f64 {
+        // Against the model, the opponents play it out in the rollout: no continuation to choose.
+        let model = if model_opp { self.rnr.as_ref().map(|r| r.model) } else { None };
         let mut biases = [0usize; MAX_PLAYERS];
         for (p, bias) in biases.iter_mut().enumerate().take(h.num_players()) {
-            if p == traverser || h.folded(p) || h.all_in(p) {
+            if p == traverser || h.folded(p) || h.all_in(p) || model.is_some() {
                 continue;
             }
             let bucket = self.abs.bucket(h.hole(p), h.board(), rng);
@@ -926,7 +933,7 @@ impl Trainer {
         }
 
         if h.folded(traverser) || h.all_in(traverser) {
-            return self.leaf_rollout(h, hist, &biases, traverser, lc, rng);
+            return self.leaf_rollout(h, hist, &biases, traverser, lc, model, rng);
         }
 
         let bucket = self.abs.bucket(h.hole(traverser), h.board(), rng);
@@ -940,7 +947,7 @@ impl Trainer {
         for (b, u) in utils.iter_mut().enumerate() {
             let mut bs = biases;
             bs[traverser] = b;
-            *u = self.leaf_rollout(h, hist, &bs, traverser, lc, rng);
+            *u = self.leaf_rollout(h, hist, &bs, traverser, lc, model, rng);
             node_util += sigma[b] * *u;
         }
         let floor = self.regret_floor();
@@ -953,7 +960,9 @@ impl Trainer {
     }
 
     /// Play the hand out from `h` with every player following the blueprint
-    /// under their continuation bias; returns the traverser's chip utility.
+    /// under their continuation bias, or, given a `model`, the opponents
+    /// playing it; returns the traverser's chip utility.
+    #[allow(clippy::too_many_arguments)]
     fn leaf_rollout(
         &self,
         h: &Hand,
@@ -961,6 +970,7 @@ impl Trainer {
         biases: &[usize; MAX_PLAYERS],
         traverser: usize,
         lc: &LeafCfg,
+        model: Option<crate::table::Baseline>,
         rng: &mut SmallRng,
     ) -> f64 {
         let mut h = h.clone();
@@ -968,13 +978,21 @@ impl Trainer {
         while !h.is_terminal() {
             let p = h.to_act();
             let acts = lc.abs.abstract_actions(&h);
-            let bucket = lc.abs.bucket(h.hole(p), h.board(), rng);
-            let mut probs: Vec<f64> = match lc.blueprint.get(bucket, &hist) {
-                Some(s) if s.len() == acts.len() => s.iter().map(|&x| x as f64).collect(),
-                _ => vec![1.0 / acts.len() as f64; acts.len()],
+            let a = match model {
+                Some(m) if p != traverser => {
+                    let a = crate::table::baseline_action(m, &h, &lc.abs, rng);
+                    if acts.contains(&a) { a } else { acts[0] }
+                }
+                _ => {
+                    let bucket = lc.abs.bucket(h.hole(p), h.board(), rng);
+                    let mut probs: Vec<f64> = match lc.blueprint.get(bucket, &hist) {
+                        Some(s) if s.len() == acts.len() => s.iter().map(|&x| x as f64).collect(),
+                        _ => vec![1.0 / acts.len() as f64; acts.len()],
+                    };
+                    apply_bias(&mut probs, &acts, biases[p]);
+                    acts[sample_index(&probs, rng)]
+                }
             };
-            apply_bias(&mut probs, &acts, biases[p]);
-            let a = acts[sample_index(&probs, rng)];
             let street_before = h.street();
             h.apply(lc.abs.concrete(&h, a));
             hist.push(a.token());

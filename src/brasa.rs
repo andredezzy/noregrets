@@ -194,7 +194,12 @@ pub enum Intent {
 /// share continues, at the model's rates for the street, the players in the hand and the size
 /// faced.
 pub fn intent(h: &Hand, rng: &mut SmallRng) -> Intent {
-    let m = model();
+    intent_by(model(), h, rng)
+}
+
+/// [`intent`] by the rates of `m`: a player who acts unlike the model in play (the simulator's
+/// opponents, to test what the model's errors cost).
+pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
     let p = h.to_act();
     let bb = h.big_blind();
     if h.street() == Street::Preflop {

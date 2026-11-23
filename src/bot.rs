@@ -120,6 +120,14 @@ pub struct SearchParams {
     /// Heads-up flops without a value net run the MCCFR resolve (as Pluribus
     /// searched every postflop decision) instead of acting from the blueprint.
     pub flop_resolve: bool,
+    /// Restricted Nash response inside the resolve: in this share of its
+    /// traversals the hero traverses against opponents playing the Brasa
+    /// model (`brasa::action`); the rest are ordinary self-play. None =
+    /// solve toward equilibrium. The heads-up vector solvers and the flop
+    /// value net solve equilibria, so this mode sends those spots to the
+    /// MCCFR resolve (heads-up flops to the blueprint, unless
+    /// `flop_resolve`), rooted at the decision.
+    pub model_p: Option<f64>,
 }
 
 /// Which part of the search routing produced a distribution.
@@ -144,6 +152,7 @@ impl Default for SearchParams {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            model_p: None,
         }
     }
 }
@@ -341,9 +350,10 @@ impl Policy {
         if real.street() == Street::Preflop {
             return blueprint(rng);
         }
+        let model = params.model_p.is_some();
         // River spots with two live players: exact range-vs-range CFR+
         // (river.rs) instead of sampled MCCFR.
-        if real.street() == Street::River && real.live_count() == 2 {
+        if real.street() == Street::River && real.live_count() == 2 && !model {
             if let Some(tr) = tracker {
                 let sess = session.as_deref();
                 if let Some((a, p)) = self.river_dist(real, hist, tr, params, sess, rng) {
@@ -355,7 +365,7 @@ impl Policy {
         // (slim bet menu), optionally inside the safety gadget. The solve's
         // river-entry CFVs are carried in the session for the river
         // resolve's gadget (continual resolving).
-        if real.street() == Street::Turn && real.live_count() == 2 {
+        if real.street() == Street::Turn && real.live_count() == 2 && !model {
             if let Some(tr) = tracker {
                 let sess = session.as_deref_mut();
                 if let Some((a, p)) = self.turn_dist(real, hist, tr, params, sess, rng) {
@@ -366,7 +376,8 @@ impl Policy {
         // Flop spots with two live players and a value net: ReBeL-style
         // depth-limited vector solving with learned leaf values.
         if real.street() == Street::Flop && real.live_count() == 2 {
-            if let (Some(tr), Some(net)) = (tracker, &self.value_net) {
+            // The net's leaf values are equilibrium values: no use against the model.
+            if let (Some(tr), Some(net), false) = (tracker, &self.value_net, model) {
                 if let Some((a, p)) = self.flop_net_dist(real, tr, net, params, rng) {
                     return (a, p, SearchSource::FlopNet);
                 }
@@ -390,8 +401,11 @@ impl Policy {
         let p = real.to_act();
         // Round-start rooting: solve from the start of this betting round
         // with the actions taken so far as the spine (see cfr::Spine).
+        // Against the model, the opponents' actions on the spine are never theirs to sample, and
+        // the hero's infoset would rarely be reached: the model mode roots at the decision.
         let round = round.filter(|r| {
             params.round_root
+                && !model
                 && !r.actions.is_empty()
                 && r.real.street() == real.street()
                 && r.hist_len + r.actions.len() == hist.len()
@@ -649,11 +663,16 @@ pub fn resolve_subgame(
     leaf: Option<LeafCfg>,
     spine: Option<Spine>,
 ) -> Trainer {
+    let rnr = params.model_p.map(|p| crate::cfr::RnrCfg {
+        model: crate::table::Baseline::Brasa,
+        p,
+    });
     let t = Trainer::new(abs, train_cfg.clone())
         .with_leaf(leaf)
         .with_plus(true)
         .with_qre(params.qre_lambda)
-        .with_spine(spine);
+        .with_spine(spine)
+        .with_rnr(rnr);
     match tracker {
         Some(tr) => {
             let sampler = move |h: &mut Hand, rng: &mut SmallRng| {
@@ -845,6 +864,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                model_p: None,
             },
             None,
             None,
@@ -1040,6 +1060,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                model_p: None,
             },
             &train_cfg,
             Some(&tracker),
@@ -1117,6 +1138,7 @@ mod tests {
                     adaptive: false,
                     round_root: true,
                     flop_resolve: false,
+                    model_p: None,
                 },
                 &train_cfg,
                 Some(&tracker),
@@ -1185,6 +1207,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            model_p: None,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         for _ in 0..4 {
@@ -1318,6 +1341,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            model_p: None,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         table.apply_abs(AbsAction::CheckCall, &abs);
@@ -1428,6 +1452,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            model_p: None,
         };
         // EV of calling 800 real: .42(+900) - .58(900) = -144 < fold -100.
         let mut rng = SmallRng::seed_from_u64(9);
@@ -1517,6 +1542,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                model_p: None,
             },
             Some(&tracker),
             Some(LeafCfg {
@@ -1535,5 +1561,63 @@ mod tests {
         let acts = abs.abstract_actions(&h);
         assert_eq!(strat.len(), acts.len());
         assert!((strat.iter().sum::<f64>() - 1.0).abs() < 1e-6);
+    }
+
+    /// The search's model mode (`model_p`): against opponents playing the Brasa model only the
+    /// hero traverses, so a resolve learns the hero's strategy and none of the opponent's.
+    #[test]
+    fn a_resolve_against_the_model_learns_only_the_heros_strategy() {
+        let hand_cfg = HandConfig {
+            num_players: 2,
+            stack: 2_000,
+            sb: 50,
+            bb: 100,
+        };
+        let abs = Arc::new(abs_small());
+        let mut h = Hand::new(&hand_cfg, 0, fresh_deck());
+        let mut hist: Vec<u8> = Vec::new();
+        let do_act = |h: &mut Hand, hist: &mut Vec<u8>, a: AbsAction| {
+            let street_before = h.street();
+            h.apply(abs.concrete(h, a));
+            hist.push(a.token());
+            if !h.is_terminal() && h.street() != street_before {
+                hist.push(crate::abstraction::TOKEN_STREET_SEP);
+            }
+        };
+        for _ in 0..4 {
+            do_act(&mut h, &mut hist, AbsAction::CheckCall); // limp, check, then checks to the turn
+        }
+        assert_eq!(h.street(), Street::Turn);
+        let hero = h.to_act();
+        let train_cfg = TrainConfig {
+            hand: hand_cfg,
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let resolve = |model_p| {
+            let params = SearchParams {
+                time_ms: 60_000,
+                max_iters: 3_000,
+                model_p,
+                ..SearchParams::default()
+            };
+            resolve_subgame(abs.clone(), &train_cfg, &h, &hist, params, None, None, None)
+        };
+        // The opponent's infosets once the hero checks.
+        let mut after = hist.clone();
+        after.push(AbsAction::CheckCall.token());
+        let opponent_strategies = |solver: &crate::cfr::Trainer| {
+            (0..abs.cfg.postflop_buckets as u16)
+                .filter(|&b| solver.avg_strategy(b, &after).is_some())
+                .count()
+        };
+
+        let equilibrium = resolve(None);
+        assert!(opponent_strategies(&equilibrium) > 0, "an equilibrium resolve learns the opponent's strategy");
+        let model = resolve(Some(1.0));
+        assert_eq!(opponent_strategies(&model), 0, "against the model the opponent learns nothing");
+        let mut rng = SmallRng::seed_from_u64(3);
+        let bucket = model.abs.bucket(h.hole(hero), h.board(), &mut rng);
+        assert!(model.avg_strategy(bucket, &hist).is_some(), "the hero's strategy is learned");
     }
 }
