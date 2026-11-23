@@ -12,51 +12,79 @@ use crate::engine::{Hand, PlayerAction, Street};
 use crate::eval::eval7;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// Unopened: (open, open or limp), as shares of hands.
-pub const UNOPENED: (f64, f64) = (0.143, 0.795);
+/// The rates and read noises a Brasa player acts by. The trainer (`train --rnr-model brasa`) and
+/// the server's simulator play the same model through [`intent`]; `BRASA_MODEL`, a JSON file of
+/// this shape, replaces the defaults in both while it is calibrated against live hands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Model {
+    /// Unopened: (open, open or limp), as shares of hands.
+    pub unopened: (f64, f64),
+    /// Facing one raise, then two or more, by the raise's size (up to 3, 6, 12, 25, 50 big
+    /// blinds and above): (re-raise, continue).
+    pub facing_raise: [[(f64, f64); 6]; 2],
+    /// The big blind's raise share when the pot comes to it unraised.
+    pub bb_raise: f64,
+    /// Postflop, unbet: bet shares by size (s, m, l); heads-up then multiway, by street.
+    pub unbet: [[[f64; 3]; 3]; 2],
+    /// Postflop, facing a bet of size s, m, l: (raise, continue); heads-up then multiway, by street.
+    pub facing: [[[(f64, f64); 3]; 3]; 2],
+    /// How far a player's read of its strength strays (0 strongest, 1 weakest).
+    pub preflop_noise: f64,
+    pub postflop_noise: f64,
+}
 
-/// Facing one raise, then two or more, by the raise's size (up to 3, 6, 12, 25, 50 big blinds and
-/// above): (re-raise, continue).
-pub const FACING_RAISE: [[(f64, f64); 6]; 2] = [
-    [(0.07, 0.80), (0.06, 0.75), (0.04, 0.54), (0.01, 0.33), (0.01, 0.27), (0.0, 0.18)],
-    [(0.21, 0.93), (0.08, 0.81), (0.05, 0.68), (0.07, 0.59), (0.05, 0.48), (0.01, 0.33)],
-];
+impl Default for Model {
+    fn default() -> Self {
+        Model {
+            unopened: (0.143, 0.795),
+            facing_raise: [
+                [(0.07, 0.80), (0.06, 0.75), (0.04, 0.54), (0.01, 0.33), (0.01, 0.27), (0.0, 0.18)],
+                [(0.21, 0.93), (0.08, 0.81), (0.05, 0.68), (0.07, 0.59), (0.05, 0.48), (0.01, 0.33)],
+            ],
+            bb_raise: 0.10,
+            unbet: [
+                [[0.10, 0.13, 0.13], [0.18, 0.13, 0.10], [0.16, 0.13, 0.18]],
+                [[0.08, 0.05, 0.06], [0.09, 0.05, 0.06], [0.09, 0.07, 0.11]],
+            ],
+            facing: [
+                [
+                    [(0.18, 0.82), (0.10, 0.57), (0.06, 0.43)],
+                    [(0.14, 0.83), (0.08, 0.66), (0.05, 0.48)],
+                    [(0.18, 0.74), (0.07, 0.57), (0.06, 0.36)],
+                ],
+                [
+                    [(0.09, 0.65), (0.04, 0.45), (0.04, 0.37)],
+                    [(0.06, 0.69), (0.05, 0.39), (0.04, 0.35)],
+                    [(0.13, 0.56), (0.08, 0.38), (0.04, 0.19)],
+                ],
+            ],
+            preflop_noise: 0.08,
+            postflop_noise: 0.12,
+        }
+    }
+}
+
+/// The model in play: `BRASA_MODEL`'s, else the defaults.
+pub fn model() -> &'static Model {
+    static MODEL: OnceLock<Model> = OnceLock::new();
+    MODEL.get_or_init(|| match std::env::var("BRASA_MODEL") {
+        Ok(path) => {
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("BRASA_MODEL {path}: {e}"));
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("BRASA_MODEL {path}: {e}"))
+        }
+        Err(_) => Model::default(),
+    })
+}
+
 pub const RAISE_SIZES_BB: [u32; 5] = [3, 6, 12, 25, 50];
-
-/// The big blind's raise share when the pot comes to it unraised.
-pub const BB_RAISE: f64 = 0.10;
-
-/// Postflop, unbet: bet shares by size (s, m, l); heads-up then multiway, by street.
-pub const UNBET: [[[f64; 3]; 3]; 2] = [
-    [[0.10, 0.13, 0.13], [0.18, 0.13, 0.10], [0.16, 0.13, 0.18]],
-    [[0.08, 0.05, 0.06], [0.09, 0.05, 0.06], [0.09, 0.07, 0.11]],
-];
-
-/// Postflop, facing a bet of size s, m, l: (raise, continue); heads-up then multiway, by street.
-pub const FACING: [[[(f64, f64); 3]; 3]; 2] = [
-    [
-        [(0.18, 0.82), (0.10, 0.57), (0.06, 0.43)],
-        [(0.14, 0.83), (0.08, 0.66), (0.05, 0.48)],
-        [(0.18, 0.74), (0.07, 0.57), (0.06, 0.36)],
-    ],
-    [
-        [(0.09, 0.65), (0.04, 0.45), (0.04, 0.37)],
-        [(0.06, 0.69), (0.05, 0.39), (0.04, 0.35)],
-        [(0.13, 0.56), (0.08, 0.38), (0.04, 0.19)],
-    ],
-];
-
-/// How far a player's read of its strength strays (0 strongest, 1 weakest).
-pub const PREFLOP_NOISE: f64 = 0.08;
-pub const POSTFLOP_NOISE: f64 = 0.12;
 
 /// The pot fractions their bets of size s, m and l stand for, and their opens in big blinds.
 pub const BET_POTS: [f64; 3] = [0.33, 0.6, 1.0];
 pub const OPEN_BB: [u32; 5] = [2, 3, 4, 5, 7];
 
-/// Runouts against one random hand when reading strength after the flop.
 const STRENGTH_RUNOUTS: usize = 16;
 
 /// A bet's size against the pot before it: 0 up to 0.4 pots, 1 up to 0.8, 2 above.
@@ -136,9 +164,95 @@ fn equity_vs_random(hole: [Card; 2], board: &[Card], runouts: usize, rng: &mut S
     won / runouts as f64
 }
 
-fn read(rank: f64, noise: f64, rng: &mut SmallRng) -> f64 {
+/// A noisy read of `rank` (0 strongest, 1 weakest).
+pub fn read(rank: f64, noise: f64, rng: &mut SmallRng) -> f64 {
     let (u, v): (f64, f64) = (rng.random::<f64>().max(1e-12), rng.random());
     rank + noise * (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// A postflop hand's strength as a rank: 1 minus its equity against one random hand, over a few
+/// random completions.
+pub fn postflop_rank(hole: [Card; 2], board: &[Card], rng: &mut SmallRng) -> f64 {
+    1.0 - equity_vs_random(hole, board, STRENGTH_RUNOUTS, rng)
+}
+
+/// What a Brasa player at `h` (its seat `h.to_act()`) means to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// Fold facing a bet, check when it can.
+    Fold,
+    CheckCall,
+    /// Raise or bet to this street total, in chips (`u32::MAX` all in).
+    RaiseTo(u32),
+}
+
+/// The decision of a Brasa player at `h`: the strongest share of its noisy read raises, the next
+/// share continues, at the model's rates for the street, the players in the hand and the size
+/// faced.
+pub fn intent(h: &Hand, rng: &mut SmallRng) -> Intent {
+    let m = model();
+    let p = h.to_act();
+    let bb = h.big_blind();
+    if h.street() == Street::Preflop {
+        let r = read(preflop_rank(h.hole(p)), m.preflop_noise, rng);
+        if h.can_check() {
+            return if r < m.bb_raise {
+                Intent::RaiseTo(OPEN_BB[rng.random_range(0..OPEN_BB.len())] * bb + h.current_bet())
+            } else {
+                Intent::CheckCall
+            };
+        }
+        let raises = usize::from(h.n_raises());
+        let (raise, cont) = if raises == 0 {
+            m.unopened
+        } else {
+            let size = h.current_bet() / bb;
+            let z = RAISE_SIZES_BB.iter().position(|&b| size < b).unwrap_or(RAISE_SIZES_BB.len());
+            m.facing_raise[(raises - 1).min(1)][z]
+        };
+        return if r >= cont {
+            Intent::Fold
+        } else if r >= raise {
+            Intent::CheckCall
+        } else if raises == 0 {
+            Intent::RaiseTo(OPEN_BB[rng.random_range(0..OPEN_BB.len())] * bb)
+        } else if raises == 1 {
+            Intent::RaiseTo(h.current_bet() * [20, 25, 30, 35][rng.random_range(0..4)] / 10)
+        } else {
+            Intent::RaiseTo(u32::MAX)
+        };
+    }
+    let table = usize::from(h.live_count() > 2);
+    let st = match h.street() {
+        Street::Flop => 0,
+        Street::Turn => 1,
+        _ => 2,
+    };
+    let r = read(postflop_rank(h.hole(p), h.board(), rng), m.postflop_noise, rng);
+    let pot = f64::from(h.pot());
+    if h.to_call() == 0 {
+        let rates = m.unbet[table][st];
+        if r >= rates.iter().sum::<f64>() {
+            return Intent::CheckCall;
+        }
+        let z = if r < rates[2] {
+            2
+        } else if r < rates[2] + rates[1] {
+            1
+        } else {
+            0
+        };
+        return Intent::RaiseTo((BET_POTS[z] * pot).round() as u32);
+    }
+    let bet = f64::from(h.to_call());
+    let (raise, cont) = m.facing[table][st][size_bucket(bet / (pot - bet).max(1.0))];
+    if r >= cont {
+        Intent::Fold
+    } else if r >= raise {
+        Intent::CheckCall
+    } else {
+        Intent::RaiseTo(h.current_bet() * 3)
+    }
 }
 
 /// The abstract raise on `acts` whose concrete total lands nearest `target`, or check/call when
@@ -161,70 +275,14 @@ fn fold_or_check(h: &Hand, acts: &[AbsAction]) -> AbsAction {
     }
 }
 
-/// The action a Brasa player takes at `h` (its seat is `h.to_act()`).
+/// The action a Brasa player takes at `h` on the abstraction's menu: its [`intent`], a raise
+/// landing on the abstract size nearest to its own.
 pub fn action(h: &Hand, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
-    let p = h.to_act();
     let acts = abs.abstract_actions(h);
-    let bb = h.big_blind();
-    if h.street() == Street::Preflop {
-        let r = read(preflop_rank(h.hole(p)), PREFLOP_NOISE, rng);
-        if h.can_check() {
-            return if r < BB_RAISE {
-                nearest_raise(h, &acts, abs, OPEN_BB[rng.random_range(0..OPEN_BB.len())] * bb + h.current_bet())
-            } else {
-                AbsAction::CheckCall
-            };
-        }
-        let raises = usize::from(h.n_raises());
-        let (raise, cont) = if raises == 0 {
-            UNOPENED
-        } else {
-            let size = h.current_bet() / bb;
-            let z = RAISE_SIZES_BB.iter().position(|&b| size < b).unwrap_or(RAISE_SIZES_BB.len());
-            FACING_RAISE[(raises - 1).min(1)][z]
-        };
-        return if r >= cont {
-            fold_or_check(h, &acts)
-        } else if r >= raise {
-            AbsAction::CheckCall
-        } else if raises == 0 {
-            nearest_raise(h, &acts, abs, OPEN_BB[rng.random_range(0..OPEN_BB.len())] * bb)
-        } else {
-            nearest_raise(h, &acts, abs, h.current_bet() * [20, 25, 30, 35][rng.random_range(0..4)] / 10)
-        };
-    }
-    let table = usize::from(h.live_count() > 2);
-    let st = match h.street() {
-        Street::Flop => 0,
-        Street::Turn => 1,
-        _ => 2,
-    };
-    let strength = equity_vs_random(h.hole(p), h.board(), STRENGTH_RUNOUTS, rng);
-    let r = read(1.0 - strength, POSTFLOP_NOISE, rng);
-    let pot = f64::from(h.pot());
-    if h.to_call() == 0 {
-        let rates = UNBET[table][st];
-        if r >= rates.iter().sum::<f64>() {
-            return AbsAction::CheckCall;
-        }
-        let z = if r < rates[2] {
-            2
-        } else if r < rates[2] + rates[1] {
-            1
-        } else {
-            0
-        };
-        return nearest_raise(h, &acts, abs, (BET_POTS[z] * pot).round() as u32);
-    }
-    let bet = f64::from(h.to_call());
-    let z = size_bucket(bet / (pot - bet).max(1.0));
-    let (raise, cont) = FACING[table][st][z];
-    if r >= cont {
-        fold_or_check(h, &acts)
-    } else if r >= raise {
-        AbsAction::CheckCall
-    } else {
-        nearest_raise(h, &acts, abs, h.current_bet() * 3)
+    match intent(h, rng) {
+        Intent::Fold => fold_or_check(h, &acts),
+        Intent::CheckCall => AbsAction::CheckCall,
+        Intent::RaiseTo(target) => nearest_raise(h, &acts, abs, target),
     }
 }
 
