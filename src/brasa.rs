@@ -15,7 +15,11 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// The rates and read noises a Brasa player acts by. The trainer (`train --rnr-model brasa`) and
+/// The rates and read noises a Brasa player acts by. The defaults are calibrated: moment-matched
+/// (four rounds, 20,000 simulated hands each) so a simulated table's raise, call, fold and bet-size
+/// shares, by street, players in the hand and size faced, sit 0.76 points on average from those of
+/// Brasa's players over 19,000 opponent actions in account1's and account2's hands (2026-11-16 to
+/// 23); the rates measured as shares of all hands sat 5.0 points off. The trainer (`train --rnr-model brasa`) and
 /// the server's simulator play the same model through [`intent`]; `BRASA_MODEL`, a JSON file of
 /// this shape, replaces the defaults in both while it is calibrated against live hands.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,26 +43,26 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Model {
-            unopened: (0.143, 0.795),
+            unopened: (0.132, 0.784),
             facing_raise: [
-                [(0.07, 0.80), (0.06, 0.75), (0.04, 0.54), (0.01, 0.33), (0.01, 0.27), (0.0, 0.18)],
-                [(0.21, 0.93), (0.08, 0.81), (0.05, 0.68), (0.07, 0.59), (0.05, 0.48), (0.01, 0.33)],
+                [(0.089, 0.75), (0.069, 0.685), (0.057, 0.538), (0.01, 0.33), (0.01, 0.27), (0.0, 0.26)],
+                [(0.21, 0.93), (0.041, 0.69), (0.018, 0.546), (0.016, 0.428), (0.003, 0.315), (0.001, 0.192)],
             ],
-            bb_raise: 0.10,
+            bb_raise: 0.144,
             unbet: [
-                [[0.10, 0.13, 0.13], [0.18, 0.13, 0.10], [0.16, 0.13, 0.18]],
-                [[0.08, 0.05, 0.06], [0.09, 0.05, 0.06], [0.09, 0.07, 0.11]],
+                [[0.087, 0.101, 0.148], [0.138, 0.112, 0.058], [0.122, 0.089, 0.111]],
+                [[0.105, 0.082, 0.064], [0.117, 0.072, 0.054], [0.128, 0.076, 0.11]],
             ],
             facing: [
                 [
-                    [(0.18, 0.82), (0.10, 0.57), (0.06, 0.43)],
-                    [(0.14, 0.83), (0.08, 0.66), (0.05, 0.48)],
-                    [(0.18, 0.74), (0.07, 0.57), (0.06, 0.36)],
+                    [(0.195, 0.716), (0.094, 0.471), (0.058, 0.47)],
+                    [(0.118, 0.713), (0.022, 0.487), (0.02, 0.423)],
+                    [(0.121, 0.634), (0.015, 0.442), (0.017, 0.344)],
                 ],
                 [
-                    [(0.09, 0.65), (0.04, 0.45), (0.04, 0.37)],
-                    [(0.06, 0.69), (0.05, 0.39), (0.04, 0.35)],
-                    [(0.13, 0.56), (0.08, 0.38), (0.04, 0.19)],
+                    [(0.125, 0.575), (0.041, 0.439), (0.029, 0.412)],
+                    [(0.058, 0.625), (0.033, 0.435), (0.012, 0.355)],
+                    [(0.106, 0.496), (0.03, 0.369), (0.021, 0.265)],
                 ],
             ],
             preflop_noise: 0.08,
