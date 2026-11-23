@@ -593,7 +593,7 @@ impl Trainer {
                     .as_ref()
                     .is_some_and(|r| rng.random::<f64>() < r.p);
                 let mut hist = Vec::with_capacity(32);
-                self.traverse(&hand, &mut hist, traverser, weight, prune_ok, model_opp, &mut rng);
+                self.traverse(&hand, &mut hist, traverser, weight, 1.0, prune_ok, model_opp, &mut rng);
                 let done = self.iters_done.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(4096) {
                     progress(done - start);
@@ -639,7 +639,7 @@ impl Trainer {
                     None => h.resample_hidden(None, &mut rng),
                 }
                 let mut hist = root_hist.to_vec();
-                self.traverse(&h, &mut hist, traverser, t as f64, false, false, &mut rng);
+                self.traverse(&h, &mut hist, traverser, t as f64, 1.0, false, false, &mut rng);
             });
             self.iters_done.fetch_add(batch, Ordering::Relaxed);
         }
@@ -648,12 +648,16 @@ impl Trainer {
     /// One external-sampling traversal. Returns utility (chips) for `traverser`.
     /// `model_opp`: this traversal's opponents play the fixed RNR model.
     #[allow(clippy::too_many_arguments)]
+    /// `own_reach`: the traverser's own probability of the path so far, which weighs its average
+    /// strategy in an RNR traversal against the model.
+    #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
         h: &Hand,
         hist: &mut Vec<u8>,
         traverser: usize,
         weight: f64,
+        own_reach: f64,
         prune_ok: bool,
         model_opp: bool,
         rng: &mut SmallRng,
@@ -704,12 +708,26 @@ impl Trainer {
             if !child.is_terminal() && child.street() != h.street() {
                 hist.push(TOKEN_STREET_SEP);
             }
-            let v = self.traverse(&child, hist, traverser, weight, prune_ok, model_opp, rng);
+            let v = self.traverse(&child, hist, traverser, weight, own_reach, prune_ok, model_opp, rng);
             hist.truncate(depth);
             return v;
         }
 
         if p == traverser {
+            // RNR (Johanson et al. 2008): the strategy kept is the average over every iteration,
+            // those against the model included. Against the model no opponent is a learner to
+            // accumulate it at its own node, so the traverser adds its strategy here, weighted by
+            // its own reach. Self-play updates each seat at five nodes of every six traversals
+            // (as a non-traverser), the model only in the one where it traverses: (players - 1)
+            // keeps the two at the RNR mixture's p : 1 - p.
+            if model_opp && !(self.cfg.snapshot_avg && h.street() != Street::Preflop) {
+                let scale = weight * own_reach * (h.num_players() - 1) as f64;
+                self.nodes.update(key, |_, strat| {
+                    for (st, &s) in strat.iter_mut().zip(sigma) {
+                        *st += scale * s;
+                    }
+                });
+            }
             // Full-width over own actions, with negative-regret pruning.
             let pluribus = self.cfg.pluribus_prune;
             let mut explore = [true; MAX_ACTS];
@@ -745,8 +763,7 @@ impl Trainer {
                 if !child.is_terminal() && child.street() != h.street() {
                     hist.push(TOKEN_STREET_SEP);
                 }
-                utils[i] =
-                    self.traverse(child, hist, traverser, weight, prune_ok, model_opp, rng);
+                utils[i] = self.traverse(child, hist, traverser, weight, own_reach * sigma[i], prune_ok, model_opp, rng);
                 hist.truncate(depth);
                 node_util += sigma[i] * utils[i];
             }
@@ -791,7 +808,7 @@ impl Trainer {
             if !child.is_terminal() && child.street() != h.street() {
                 hist.push(TOKEN_STREET_SEP);
             }
-            self.traverse(&child, hist, traverser, weight, prune_ok, model_opp, rng)
+            self.traverse(&child, hist, traverser, weight, own_reach, prune_ok, model_opp, rng)
         } else {
             // Sample one opponent action from their modeled strategy
             // (regret matching, or logit QRE when exploiting) and
@@ -863,7 +880,7 @@ impl Trainer {
                 hist.push(TOKEN_STREET_SEP);
             }
             // No truncation needed: the nearest traverser ancestor restores hist.
-            let v = ratio * self.traverse(&child, hist, traverser, weight, prune_ok, model_opp, rng);
+            let v = ratio * self.traverse(&child, hist, traverser, weight, own_reach, prune_ok, model_opp, rng);
             if !self.vr {
                 return v;
             }
@@ -1870,6 +1887,18 @@ mod tests {
                 assert!((a - 0.1 * b).abs() <= 1e-9 * b.abs().max(1.0), "{a} vs 0.1 x {b}");
             }
         }
+    }
+
+    #[test]
+    fn rnr_traversals_against_the_model_build_the_traversers_average() {
+        use crate::table::Baseline;
+        let t = push_fold_trainer().with_rnr(Some(RnrCfg { model: Baseline::Caller, p: 1.0 }));
+        t.run(5_000, &|_| {});
+        let mut with_average = 0;
+        t.nodes.for_each(|_, _, strat| with_average += usize::from(strat.iter().sum::<f64>() > 0.0));
+        assert!(with_average > 0, "an all-model RNR run kept no average strategy");
+        let aa = preflop_bucket([make_card(12, 0), make_card(12, 1)]);
+        assert!(t.avg_strategy(aa, &[]).is_some(), "the root has no average after 5,000 model traversals");
     }
 
     #[test]
