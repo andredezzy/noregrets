@@ -39,9 +39,14 @@ pub struct Model {
     /// Postflop, facing a bet, by its size against the pot before it ([`size_bucket`]: up to 0.4,
     /// 0.8, 1.5, 3 and 6 pots, and above): (raise, continue); heads-up then multiway, by street.
     pub facing: [[[(f64, f64); 6]; 3]; 2],
-    /// How far a player's read of its strength strays (0 strongest, 1 weakest).
+    /// How far a player's read of its strength strays (0 strongest, 1 weakest): preflop, postflop, and postflop facing
+    /// a bet above 0.8 pots ([`BIG_BET_SIZE`]). That last one was fitted on the 176 hands Brasa's players had to show
+    /// after calling such a bet (river calls and all-in calls, 2026-11-16 to 24): it lands at 0.14 on the flop and
+    /// turn, the rest of their play's 0.12. No noise fits the river's callers: they hold more air and more two pairs
+    /// or better than the model's (top pair or better 50% against 43%), a mix no single noise reads.
     pub preflop_noise: f64,
     pub postflop_noise: f64,
+    pub big_bet_noise: f64,
 }
 
 impl Default for Model {
@@ -71,6 +76,7 @@ impl Default for Model {
             ],
             preflop_noise: 0.08,
             postflop_noise: 0.12,
+            big_bet_noise: 0.12,
         }
     }
 }
@@ -102,6 +108,9 @@ pub const FACING_POTS: [f64; 5] = [0.4, 0.8, 1.5, 3.0, 6.0];
 // WARNING: with every bet above 0.8 pots one size, a model player continued against a 17-pot shove
 // as often as against a pot bet, and the search shoved 130 bb into 7.5 with top pair, weak kicker
 // (account1, 2026-11-24 03:02Z); Brasa's players fold 53% of pot bets and 79% of bets above 6 pots.
+/// The first of the sizes a bet is faced at that [`Model::big_bet_noise`] reads: above 0.8 pots.
+pub const BIG_BET_SIZE: usize = 2;
+
 /// A bet's size against the pot before it, as the index of the first [`FACING_POTS`] bound it is
 /// within (5 above them all).
 pub fn size_bucket(pots: f64) -> usize {
@@ -243,9 +252,10 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
         Street::Turn => 1,
         _ => 2,
     };
-    let r = read(postflop_rank(h.hole(p), h.board(), rng), m.postflop_noise, rng);
+    let rank = postflop_rank(h.hole(p), h.board(), rng);
     let pot = f64::from(h.pot());
     if h.to_call() == 0 {
+        let r = read(rank, m.postflop_noise, rng);
         let rates = m.unbet[table][st];
         if r >= rates.iter().sum::<f64>() {
             return Intent::CheckCall;
@@ -260,7 +270,9 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
         return Intent::RaiseTo((BET_POTS[z] * pot).round() as u32);
     }
     let bet = f64::from(h.to_call());
-    let (raise, cont) = m.facing[table][st][size_bucket(bet / (pot - bet).max(1.0))];
+    let size = size_bucket(bet / (pot - bet).max(1.0));
+    let (raise, cont) = m.facing[table][st][size];
+    let r = read(rank, if size >= BIG_BET_SIZE { m.big_bet_noise } else { m.postflop_noise }, rng);
     if r >= cont {
         Intent::Fold
     } else if r >= raise {
@@ -356,7 +368,12 @@ mod tests {
     /// A heads-up flop K-9-2 where the big blind (seat 1) bets `bet` into the 200-chip pot and the
     /// button (seat 0, 9-8: middle pair) faces it, 1000 big blinds deep.
     fn facing_flop_bet(bet: u32) -> Hand {
-        let cards = parse_cards("9h 8h Ad Qd Kc 9c 2d").expect("cards parse");
+        facing_flop_bet_with("9h 8h", bet)
+    }
+
+    /// [`facing_flop_bet`] with the button holding `hole`.
+    fn facing_flop_bet_with(hole: &str, bet: u32) -> Hand {
+        let cards = parse_cards(&format!("{hole} Ad Qd Kc 9c 2d")).expect("cards parse");
         let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
         for (i, &c) in cards.iter().enumerate() {
             deck.insert(i, c);
@@ -382,6 +399,24 @@ mod tests {
         let pot_bet = fold_share(&facing_flop_bet(200), 2000);
         let shove = fold_share(&facing_flop_bet(2000), 2000);
         assert!(shove > pot_bet + 0.1, "folds a pot bet {pot_bet}, a ten-pot shove {shove}");
+    }
+
+    fn continue_share(m: &Model, h: &Hand, n: usize) -> f64 {
+        let mut rng = SmallRng::seed_from_u64(13);
+        let goes_on = (0..n).filter(|_| intent_by(m, h, &mut rng) != Intent::Fold).count();
+        goes_on as f64 / n as f64
+    }
+
+    #[test]
+    fn a_bet_above_the_pot_is_read_with_its_own_noise() {
+        // 7-3 offsuit on K-9-2: no pair and no draw.
+        let quiet = Model { postflop_noise: 0.0, big_bet_noise: 0.0, ..Model::default() };
+        let loose = Model { big_bet_noise: 0.6, ..quiet.clone() };
+        let half_pot = facing_flop_bet_with("7s 3h", 100);
+        let two_pots = facing_flop_bet_with("7s 3h", 400);
+        assert_eq!(continue_share(&loose, &half_pot, 2000), continue_share(&quiet, &half_pot, 2000));
+        let (q, l) = (continue_share(&quiet, &two_pots, 2000), continue_share(&loose, &two_pots, 2000));
+        assert!(l > q + 0.1, "continues two pots read quietly {q}, loosely {l}");
     }
 
     #[test]
