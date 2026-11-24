@@ -16,10 +16,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// The rates and read noises a Brasa player acts by. The defaults are calibrated: moment-matched
-/// (four rounds, 20,000 simulated hands each) so a simulated table's raise, call, fold and bet-size
-/// shares, by street, players in the hand and size faced, sit 0.76 points on average from those of
-/// Brasa's players over 19,000 opponent actions in account1's and account2's hands (2026-11-16 to
-/// 23); the rates measured as shares of all hands sat 5.0 points off. The trainer (`train --rnr-model brasa`) and
+/// so a simulated table's raise, call, fold and bet-size shares, by street, players in the hand and
+/// size faced, sit 0.45 points on average from those of Brasa's players over 19,000 opponent actions
+/// in account1's and account2's hands (2026-11-16 to 24), and 0.76 points facing bets above 1.5 pots,
+/// whose three sizes match their shares pooled over the streets (live data there is thin: 82 to 678
+/// actions a size); 40,000 simulated hands a round, blueprint A with its search at 300 ms. Read
+/// noise puts a strong hand's read below a small threshold, so the raise thresholds facing the
+/// biggest bets sit below zero. The trainer (`train --rnr-model brasa`) and
 /// the server's simulator play the same model through [`intent`]; `BRASA_MODEL`, a JSON file of
 /// this shape, replaces the defaults in both while it is calibrated against live hands.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,8 +36,9 @@ pub struct Model {
     pub bb_raise: f64,
     /// Postflop, unbet: bet shares by size (s, m, l); heads-up then multiway, by street.
     pub unbet: [[[f64; 3]; 3]; 2],
-    /// Postflop, facing a bet of size s, m, l: (raise, continue); heads-up then multiway, by street.
-    pub facing: [[[(f64, f64); 3]; 3]; 2],
+    /// Postflop, facing a bet, by its size against the pot before it ([`size_bucket`]: up to 0.4,
+    /// 0.8, 1.5, 3 and 6 pots, and above): (raise, continue); heads-up then multiway, by street.
+    pub facing: [[[(f64, f64); 6]; 3]; 2],
     /// How far a player's read of its strength strays (0 strongest, 1 weakest).
     pub preflop_noise: f64,
     pub postflop_noise: f64,
@@ -43,26 +47,26 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Model {
-            unopened: (0.132, 0.784),
+            unopened: (0.13, 0.783),
             facing_raise: [
-                [(0.089, 0.75), (0.069, 0.685), (0.057, 0.538), (0.01, 0.33), (0.01, 0.27), (0.0, 0.26)],
-                [(0.21, 0.93), (0.041, 0.69), (0.018, 0.546), (0.016, 0.428), (0.003, 0.315), (0.001, 0.192)],
+                [(0.083, 0.753), (0.068, 0.685), (0.059, 0.534), (0.01, 0.33), (0.01, 0.27), (0.0, 0.248)],
+                [(0.21, 0.93), (0.032, 0.688), (0.012, 0.543), (0.011, 0.424), (0.001, 0.313), (0.001, 0.186)],
             ],
-            bb_raise: 0.144,
+            bb_raise: 0.145,
             unbet: [
-                [[0.087, 0.101, 0.148], [0.138, 0.112, 0.058], [0.122, 0.089, 0.111]],
-                [[0.105, 0.082, 0.064], [0.117, 0.072, 0.054], [0.128, 0.076, 0.11]],
+                [[0.089, 0.099, 0.148], [0.137, 0.112, 0.052], [0.113, 0.093, 0.111]],
+                [[0.104, 0.08, 0.065], [0.117, 0.072, 0.053], [0.127, 0.079, 0.106]],
             ],
             facing: [
                 [
-                    [(0.195, 0.716), (0.094, 0.471), (0.058, 0.47)],
-                    [(0.118, 0.713), (0.022, 0.487), (0.02, 0.423)],
-                    [(0.121, 0.634), (0.015, 0.442), (0.017, 0.344)],
+                    [(0.194, 0.711), (0.104, 0.488), (0.05, 0.462), (-0.042, 0.339), (-0.017, 0.339), (-0.047, 0.303)],
+                    [(0.111, 0.706), (0.017, 0.481), (0.027, 0.43), (-0.047, 0.306), (-0.026, 0.306), (-0.049, 0.272)],
+                    [(0.122, 0.629), (0.007, 0.448), (0.022, 0.422), (-0.048, 0.248), (-0.027, 0.248), (-0.049, 0.221)],
                 ],
                 [
-                    [(0.125, 0.575), (0.041, 0.439), (0.029, 0.412)],
-                    [(0.058, 0.625), (0.033, 0.435), (0.012, 0.355)],
-                    [(0.106, 0.496), (0.03, 0.369), (0.021, 0.265)],
+                    [(0.124, 0.579), (0.047, 0.454), (0.034, 0.426), (0.001, 0.333), (-0.046, 0.298), (-0.022, 0.278)],
+                    [(0.057, 0.62), (0.029, 0.415), (0.003, 0.361), (-0.005, 0.287), (-0.048, 0.257), (-0.023, 0.239)],
+                    [(0.097, 0.49), (0.025, 0.367), (0.021, 0.286), (-0.002, 0.214), (-0.047, 0.192), (-0.023, 0.179)],
                 ],
             ],
             preflop_noise: 0.08,
@@ -91,15 +95,17 @@ pub const OPEN_BB: [u32; 5] = [2, 3, 4, 5, 7];
 
 const STRENGTH_RUNOUTS: usize = 16;
 
-/// A bet's size against the pot before it: 0 up to 0.4 pots, 1 up to 0.8, 2 above.
+/// The upper bounds of the sizes a bet is faced at, in pots before it; a bet above the last is
+/// the sixth size.
+pub const FACING_POTS: [f64; 5] = [0.4, 0.8, 1.5, 3.0, 6.0];
+
+// WARNING: with every bet above 0.8 pots one size, a model player continued against a 17-pot shove
+// as often as against a pot bet, and the search shoved 130 bb into 7.5 with top pair, weak kicker
+// (account1, 2026-11-24 03:02Z); Brasa's players fold 53% of pot bets and 79% of bets above 6 pots.
+/// A bet's size against the pot before it, as the index of the first [`FACING_POTS`] bound it is
+/// within (5 above them all).
 pub fn size_bucket(pots: f64) -> usize {
-    if pots <= 0.4 {
-        0
-    } else if pots <= 0.8 {
-        1
-    } else {
-        2
-    }
+    FACING_POTS.iter().position(|&b| pots <= b).unwrap_or(FACING_POTS.len())
 }
 
 /// Share of preflop hands stronger than `hole` (by equity against one random hand).
@@ -345,6 +351,44 @@ mod tests {
         let (fold, call, _) = shares(&deal("7d 2c"), 400);
         assert!(fold > 0.6, "72o folds {fold}");
         assert!(call < 0.4);
+    }
+
+    /// A heads-up flop K-9-2 where the big blind (seat 1) bets `bet` into the 200-chip pot and the
+    /// button (seat 0, 9-8: middle pair) faces it, 1000 big blinds deep.
+    fn facing_flop_bet(bet: u32) -> Hand {
+        let cards = parse_cards("9h 8h Ad Qd Kc 9c 2d").expect("cards parse");
+        let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
+        for (i, &c) in cards.iter().enumerate() {
+            deck.insert(i, c);
+        }
+        let deck: [u8; 52] = deck.try_into().expect("52 cards");
+        let cfg = HandConfig { num_players: 2, stack: 100_000, ..HandConfig::default() };
+        let mut h = Hand::new(&cfg, 0, deck);
+        h.apply(PlayerAction::CheckCall);
+        h.apply(PlayerAction::CheckCall);
+        assert_eq!((h.street(), h.to_act(), h.pot()), (Street::Flop, 1, 200));
+        h.apply(PlayerAction::RaiseTo(bet));
+        h
+    }
+
+    fn fold_share(h: &Hand, n: usize) -> f64 {
+        let mut rng = SmallRng::seed_from_u64(11);
+        let folds = (0..n).filter(|_| intent(h, &mut rng) == Intent::Fold).count();
+        folds as f64 / n as f64
+    }
+
+    #[test]
+    fn a_middle_pair_folds_a_ten_pot_shove_more_often_than_a_pot_bet() {
+        let pot_bet = fold_share(&facing_flop_bet(200), 2000);
+        let shove = fold_share(&facing_flop_bet(2000), 2000);
+        assert!(shove > pot_bet + 0.1, "folds a pot bet {pot_bet}, a ten-pot shove {shove}");
+    }
+
+    #[test]
+    fn bets_are_faced_at_six_sizes_by_their_share_of_the_pot() {
+        let sizes: Vec<usize> = [0.3, 0.5, 1.0, 2.0, 4.0, 17.0].iter().map(|&p| size_bucket(p)).collect();
+        assert_eq!(sizes, [0, 1, 2, 3, 4, 5]);
+        assert_eq!((size_bucket(0.8), size_bucket(1.5), size_bucket(6.0)), (1, 2, 4));
     }
 
     #[test]
