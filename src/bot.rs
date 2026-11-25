@@ -128,6 +128,11 @@ pub struct SearchParams {
     /// MCCFR resolve (heads-up flops to the blueprint, unless
     /// `flop_resolve`), rooted at the decision.
     pub model_p: Option<f64>,
+    /// The MCCFR resolve's own bet menu (None = the blueprint's), over the
+    /// blueprint's buckets: `MenuShape::PluribusOverbet` lets it bet 1.5 and
+    /// 3 pots first-in where the blueprint knows only half a pot, a pot and
+    /// all-in. Its depth-limit rollouts map those bets onto the blueprint's.
+    pub menu: Option<crate::abstraction::MenuShape>,
 }
 
 /// Which part of the search routing produced a distribution.
@@ -153,6 +158,7 @@ impl Default for SearchParams {
             round_root: true,
             flop_resolve: false,
             model_p: None,
+            menu: None,
         }
     }
 }
@@ -395,9 +401,14 @@ impl Policy {
                 blueprint: self.blueprint.clone(),
                 abs: self.abs.clone(),
                 limit: Street::Flop,
+                root: None,
             })
         };
         let sabs = self.search_abs.clone().unwrap_or_else(|| self.abs.clone());
+        let sabs = match params.menu {
+            Some(menu) if menu != sabs.cfg.menu => Arc::new(sabs.with_menu(menu)),
+            _ => sabs,
+        };
         let p = real.to_act();
         // Round-start rooting: solve from the start of this betting round
         // with the actions taken so far as the spine (see cfr::Spine).
@@ -667,6 +678,10 @@ pub fn resolve_subgame(
         model: crate::table::Baseline::Brasa,
         p,
     });
+    let leaf = leaf.map(|l| LeafCfg {
+        root: Some((root.clone(), root_hist.len())),
+        ..l
+    });
     let t = Trainer::new(abs, train_cfg.clone())
         .with_leaf(leaf)
         .with_plus(true)
@@ -865,6 +880,7 @@ mod tests {
                 round_root: true,
                 flop_resolve: false,
                 model_p: None,
+                menu: None,
             },
             None,
             None,
@@ -1061,6 +1077,7 @@ mod tests {
                 round_root: true,
                 flop_resolve: false,
                 model_p: None,
+                menu: None,
             },
             &train_cfg,
             Some(&tracker),
@@ -1139,6 +1156,7 @@ mod tests {
                     round_root: true,
                     flop_resolve: false,
                     model_p: None,
+                    menu: None,
                 },
                 &train_cfg,
                 Some(&tracker),
@@ -1208,6 +1226,7 @@ mod tests {
             round_root: true,
             flop_resolve: false,
             model_p: None,
+            menu: None,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         for _ in 0..4 {
@@ -1342,6 +1361,7 @@ mod tests {
             round_root: true,
             flop_resolve: false,
             model_p: None,
+            menu: None,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         table.apply_abs(AbsAction::CheckCall, &abs);
@@ -1453,6 +1473,7 @@ mod tests {
             round_root: true,
             flop_resolve: false,
             model_p: None,
+            menu: None,
         };
         // EV of calling 800 real: .42(+900) - .58(900) = -144 < fold -100.
         let mut rng = SmallRng::seed_from_u64(9);
@@ -1543,12 +1564,14 @@ mod tests {
                 round_root: true,
                 flop_resolve: false,
                 model_p: None,
+                menu: None,
             },
             Some(&tracker),
             Some(LeafCfg {
                 blueprint: bp.clone(),
                 abs: abs.clone(),
                 limit: Street::Flop,
+                root: None,
             }),
         None,
         );

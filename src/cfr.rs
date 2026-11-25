@@ -19,6 +19,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use hashbrown::HashTable;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -311,6 +312,10 @@ pub struct LeafCfg {
     /// the solver's abstraction may be finer).
     pub abs: Arc<Abstraction>,
     pub limit: Street,
+    /// The subgame's root and its history's length (`resolve_subgame` sets
+    /// them): a solver whose menu differs from the blueprint's replays its
+    /// line from there to look the blueprint up (`Trainer::blueprint_hist`).
+    pub root: Option<(Hand, usize)>,
 }
 
 const LEAF_BIASES: usize = 4; // 0 = blueprint, 1 = fold-, 2 = call-, 3 = raise-biased
@@ -932,8 +937,9 @@ impl Trainer {
             *bias = sample_index(&sigma, rng);
         }
 
+        let bp_hist = self.blueprint_hist(lc, hist);
         if h.folded(traverser) || h.all_in(traverser) {
-            return self.leaf_rollout(h, hist, &biases, traverser, lc, model, rng);
+            return self.leaf_rollout(h, &bp_hist, &biases, traverser, lc, model, rng);
         }
 
         let bucket = self.abs.bucket(h.hole(traverser), h.board(), rng);
@@ -947,7 +953,7 @@ impl Trainer {
         for (b, u) in utils.iter_mut().enumerate() {
             let mut bs = biases;
             bs[traverser] = b;
-            *u = self.leaf_rollout(h, hist, &bs, traverser, lc, model, rng);
+            *u = self.leaf_rollout(h, &bp_hist, &bs, traverser, lc, model, rng);
             node_util += sigma[b] * *u;
         }
         let floor = self.regret_floor();
@@ -957,6 +963,46 @@ impl Trainer {
             }
         });
         node_util
+    }
+
+    /// `hist` as the leaf blueprint's menu would have recorded it: a bet in
+    /// the solver's menu and not in the blueprint's (a search's overbet)
+    /// becomes the blueprint's nearest raise, as the table maps an off-tree
+    /// bet, so the rollout finds the blueprint's strategy after it instead
+    /// of playing uniformly at random. Replayed from the subgame's root, at
+    /// the real actions along the round's spine.
+    fn blueprint_hist<'a>(&self, lc: &LeafCfg, hist: &'a [u8]) -> Cow<'a, [u8]> {
+        if lc.abs.cfg.menu == self.abs.cfg.menu {
+            return Cow::Borrowed(hist);
+        }
+        let (root, root_len) = lc
+            .root
+            .as_ref()
+            .expect("a leaf whose blueprint has another menu than the solver's needs the subgame's root");
+        let mut h = root.clone();
+        let mut out = hist[..*root_len].to_vec();
+        let line = &hist[*root_len..];
+        for (k, &t) in line.iter().enumerate() {
+            let Some(a) = AbsAction::from_token(t) else {
+                out.push(t);
+                continue;
+            };
+            let spine_step = self
+                .spine
+                .as_ref()
+                .filter(|sp| k < sp.steps.len() && line[..=k] == sp.tokens[..=k])
+                .map(|sp| sp.steps[k].1);
+            let act = spine_step.unwrap_or_else(|| self.abs.concrete(&h, a));
+            let mapped = match act {
+                PlayerAction::RaiseTo(to) if spine_step.is_none() && !lc.abs.abstract_actions(&h).contains(&a) => {
+                    lc.abs.map_raise(&h, to)
+                }
+                _ => a,
+            };
+            out.push(mapped.token());
+            h.apply(act);
+        }
+        Cow::Owned(out)
     }
 
     /// Play the hand out from `h` with every player following the blueprint
@@ -1721,6 +1767,49 @@ mod tests {
         assert!(aa_call[1] > 0.8, "AA should call a shove, got {:.3}", aa_call[1]);
         let btn_aa = t.avg_strategy(aa, &[]).expect("root AA visited");
         assert!(btn_aa[0] < 0.1, "button must not fold AA, got {:.3}", btn_aa[0]);
+    }
+
+    /// A search's overbet, a size its blueprint never trained, reaches the
+    /// depth-limit rollouts as the blueprint's nearest raise, the way the
+    /// table maps an off-tree bet; the actions both menus share pass as they
+    /// are, and a solver on the blueprint's own menu keeps its history.
+    #[test]
+    fn leaf_rollouts_see_a_search_overbet_as_the_blueprints_nearest_raise() {
+        let bp_abs = Arc::new(Abstraction::new(AbsConfig::default()));
+        let search_abs = Arc::new(bp_abs.with_menu(crate::abstraction::MenuShape::PluribusOverbet));
+        let cfg = HandConfig::default();
+        let mut root = Hand::new(&cfg, 0, fresh_deck());
+        for _ in 0..cfg.num_players {
+            root.apply(PlayerAction::CheckCall);
+        }
+        let mut root_hist = vec![AbsAction::CheckCall.token(); cfg.num_players];
+        root_hist.push(TOKEN_STREET_SEP);
+        let blueprint = Arc::new(Trainer::new(bp_abs.clone(), TrainConfig::default()).to_blueprint());
+        let leaf = LeafCfg {
+            blueprint,
+            abs: bp_abs.clone(),
+            limit: Street::Flop,
+            root: Some((root.clone(), root_hist.len())),
+        };
+        let solver = Trainer::new(search_abs.clone(), TrainConfig::default());
+        let line = |acts: &[AbsAction]| -> Vec<u8> {
+            root_hist.iter().copied().chain(acts.iter().map(|a| a.token())).collect()
+        };
+        let overbet = line(&[AbsAction::Bet(5), AbsAction::CheckCall]);
+        let to = match search_abs.concrete(&root, AbsAction::Bet(5)) {
+            PlayerAction::RaiseTo(to) => to,
+            other => panic!("a bet, got {other:?}"),
+        };
+        let nearest = bp_abs.map_raise(&root, to);
+        assert_eq!(nearest, AbsAction::Bet(4), "1.5 pots is nearest a pot at 100 big blinds");
+        assert_eq!(
+            solver.blueprint_hist(&leaf, &overbet).as_ref(),
+            line(&[nearest, AbsAction::CheckCall]).as_slice()
+        );
+        let pot = line(&[AbsAction::Bet(4), AbsAction::CheckCall]);
+        assert_eq!(solver.blueprint_hist(&leaf, &pot).as_ref(), pot.as_slice());
+        let same_menu = Trainer::new(bp_abs.clone(), TrainConfig::default());
+        assert!(matches!(same_menu.blueprint_hist(&leaf, &overbet), Cow::Borrowed(_)));
     }
 
     /// Spine bookkeeping: a node is on the spine only while the history

@@ -290,6 +290,7 @@ mod tests {
                 round_root: true,
                 flop_resolve: false,
                 model_p: None,
+                menu: None,
             },
             alpha: 0.5,
             seed: 42,

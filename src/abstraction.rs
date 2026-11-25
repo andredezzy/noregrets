@@ -41,6 +41,17 @@ impl AbsAction {
             AbsAction::Bet(i) => 3 + i,
         }
     }
+
+    /// The action a history token records; None for the street separator and the leaf suffix.
+    pub fn from_token(t: u8) -> Option<AbsAction> {
+        match t {
+            0 => Some(AbsAction::Fold),
+            1 => Some(AbsAction::CheckCall),
+            2 => Some(AbsAction::AllIn),
+            t if t >= 3 && ((t - 3) as usize) < BET_SIZES.len() => Some(AbsAction::Bet(t - 3)),
+            _ => None,
+        }
+    }
 }
 
 /// Number of quantiles representing an equity distribution (flop/turn).
@@ -99,11 +110,14 @@ impl Default for AbsConfig {
 /// - `PluribusFinePre`: `Pluribus` postflop plus a fine preflop menu
 ///   (7 opens, 5 three-bet sizes, 3 four-bet sizes), because Pluribus
 ///   never searches preflop and so made that round's abstraction fine.
+/// - `PluribusOverbet`: `Pluribus` with first-in postflop bets of 1.5 and
+///   3 pots as well: a search menu (`SearchParams::menu`), not a blueprint's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum MenuShape {
     Wide,
     Pluribus,
     PluribusFinePre,
+    PluribusOverbet,
 }
 
 /// K-medians cluster centers, one set per street. Two feature families
@@ -337,20 +351,22 @@ fn train_street_centroids(
 pub struct Abstraction {
     pub cfg: AbsConfig,
     pub centroids: Option<Centroids>,
-    /// Exact-key memo (hot path: one packed-u64 lookup per visit).
-    cache: DashMap<u64, u16, ahash::RandomState>,
+    /// Exact-key memo (hot path: one packed-u64 lookup per visit). The
+    /// memos are shared with the copies `with_menu` makes, whose buckets are
+    /// the same.
+    cache: Arc<DashMap<u64, u16, ahash::RandomState>>,
     /// Suit-canonical memo, consulted only on exact-cache misses so the
     /// expensive Monte Carlo work runs once per isomorphism class (up to
     /// 24 suit relabelings share one entry).
-    canon: DashMap<u64, u16, ahash::RandomState>,
+    canon: Arc<DashMap<u64, u16, ahash::RandomState>>,
     /// Exact river buckets, one table per suit-canonical BOARD covering
     /// every hole combo at once (O(N) sweep, ~1326 evals per board). The
     /// canonical river-board space is ~134k entries, so this converges to
     /// pure lookups; per-pair Monte Carlo river equity cost 200 rollouts
     /// per miss and dominated blueprint training (83% of samples).
-    river_boards: DashMap<u64, std::sync::Arc<Vec<u16>>, ahash::RandomState>,
+    river_boards: Arc<DashMap<u64, Arc<Vec<u16>>, ahash::RandomState>>,
     /// Previous-round context, required when `centroids.is_strategic()`.
-    strat: Option<StratCtx>,
+    strat: Option<Arc<StratCtx>>,
 }
 
 impl Abstraction {
@@ -364,10 +380,26 @@ impl Abstraction {
         Abstraction {
             cfg,
             centroids,
-            cache: DashMap::with_hasher(ahash::RandomState::new()),
-            canon: DashMap::with_hasher(ahash::RandomState::new()),
-            river_boards: DashMap::with_hasher(ahash::RandomState::new()),
+            cache: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            canon: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            river_boards: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
             strat: None,
+        }
+    }
+
+    /// This abstraction's buckets under another bet menu, sharing its
+    /// bucket memos: a search can bet sizes its blueprint never trained.
+    pub fn with_menu(&self, menu: MenuShape) -> Abstraction {
+        Abstraction {
+            cfg: AbsConfig {
+                menu,
+                ..self.cfg.clone()
+            },
+            centroids: self.centroids.clone(),
+            cache: self.cache.clone(),
+            canon: self.canon.clone(),
+            river_boards: self.river_boards.clone(),
+            strat: self.strat.clone(),
         }
     }
 
@@ -446,7 +478,7 @@ impl Abstraction {
     /// Attach the previous-round blueprint context needed to evaluate
     /// strategic fingerprints at cache misses.
     pub fn with_strat(mut self, sc: StratCtx) -> Self {
-        self.strat = Some(sc);
+        self.strat = Some(Arc::new(sc));
         self
     }
 
@@ -457,22 +489,24 @@ impl Abstraction {
     /// to bound the tree.
     pub fn bet_menu(&self, street: Street, n_raises: u8) -> &'static [u8] {
         match (self.cfg.menu, street, n_raises) {
-            // Preflop: Wide and Pluribus share the 2026-07 preflop menu.
-            (MenuShape::Wide | MenuShape::Pluribus, Street::Preflop, 0) => &[1, 2, 3, 4],
-            (MenuShape::Wide | MenuShape::Pluribus, Street::Preflop, 1) => &[2, 4, 6],
-            (MenuShape::Wide | MenuShape::Pluribus, Street::Preflop, 2) => &[4, 6],
-            (MenuShape::Wide | MenuShape::Pluribus, Street::Preflop, _) => &[],
             // Fine preflop: 7 opens (1.6x..6x), 5 three-bets, 3 four-bets.
             (MenuShape::PluribusFinePre, Street::Preflop, 0) => &[0, 1, 2, 3, 4, 5, 6],
             (MenuShape::PluribusFinePre, Street::Preflop, 1) => &[1, 2, 3, 4, 6],
             (MenuShape::PluribusFinePre, Street::Preflop, 2) => &[2, 4, 6],
             (MenuShape::PluribusFinePre, Street::Preflop, _) => &[4],
+            // Every other shape shares the 2026-07 preflop menu.
+            (_, Street::Preflop, 0) => &[1, 2, 3, 4],
+            (_, Street::Preflop, 1) => &[2, 4, 6],
+            (_, Street::Preflop, 2) => &[4, 6],
+            (_, Street::Preflop, _) => &[],
             // Wide postflop: 25..200% first-in, 4-size raises, 2-size re-raises.
             (MenuShape::Wide, Street::Flop, 0) => &[0, 1, 2, 3, 4, 5, 6],
             (MenuShape::Wide, _, 0) => &[1, 2, 3, 4, 5, 6],
             (MenuShape::Wide, _, 1) => &[2, 3, 4, 6],
             (MenuShape::Wide, _, 2) => &[4, 6],
             (MenuShape::Wide, _, _) => &[],
+            // Pluribus postflop with overbets: 50% to 300% (+ all-in) first-in.
+            (MenuShape::PluribusOverbet, _, 0) => &[2, 4, 5, 7],
             // Pluribus postflop: 50%/100% (+ all-in) first-in, pot (+ all-in)
             // raise, call/fold/all-in beyond.
             (_, _, 0) => &[2, 4],
@@ -1297,6 +1331,38 @@ mod tests {
         let acts = a.abstract_actions(&h);
         assert!(!acts.contains(&AbsAction::Fold));
         assert!(acts.contains(&AbsAction::CheckCall));
+    }
+
+    /// The search's overbet menu bets 1.5 and 3 pots first-in besides
+    /// Pluribus's half pot and pot, raises and plays preflop as Pluribus
+    /// does, and buckets as the abstraction it was made from.
+    #[test]
+    fn overbet_menu_adds_one_and_a_half_and_three_pots_first_in() {
+        let plu = abs();
+        let over = plu.with_menu(MenuShape::PluribusOverbet);
+        let bets = |a: &Abstraction, h: &Hand| -> Vec<AbsAction> {
+            a.abstract_actions(h)
+                .into_iter()
+                .filter(|x| matches!(x, AbsAction::Bet(_)))
+                .collect()
+        };
+        let cfg = HandConfig::default();
+        let root = Hand::new(&cfg, 0, fresh_deck());
+        assert_eq!(over.abstract_actions(&root), plu.abstract_actions(&root), "preflop as Pluribus");
+        let mut flop = root.clone();
+        for _ in 0..cfg.num_players {
+            flop.apply(PlayerAction::CheckCall);
+        }
+        assert_eq!(flop.street(), Street::Flop);
+        let first_in = [AbsAction::Bet(2), AbsAction::Bet(4), AbsAction::Bet(5), AbsAction::Bet(7)];
+        assert_eq!(bets(&over, &flop), first_in);
+        let mut raised = flop.clone();
+        raised.apply(over.concrete(&raised, AbsAction::Bet(7)));
+        assert_eq!(bets(&over, &raised), bets(&plu, &raised), "raises as Pluribus");
+        let mut rng = SmallRng::seed_from_u64(1);
+        let hole = flop.hole(0);
+        let bucket = plu.bucket(hole, flop.board(), &mut rng);
+        assert_eq!(over.bucket(hole, flop.board(), &mut rng), bucket);
     }
 
     /// Modern action abstraction: >=4 open sizes preflop, >=7 first-in
