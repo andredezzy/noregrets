@@ -1,13 +1,13 @@
 //! Brasa players as a fixed opponent model, for restricted Nash response training
-//! (`train --rnr-model brasa`) and evaluation. Measured on the hands of two accounts at Brasa's
-//! 0.05/0.10 tables (Nov 2026, about 16k preflop and 10k postflop actions of opponents): they
+//! (`train --rnr-model brasa`) and evaluation. Measured on the hands of three accounts at Brasa's
+//! 0.05/0.10 tables (Nov 2026, about 21k preflop and 30k postflop actions of opponents): they
 //! limp two thirds of their hands, call two thirds of small raises and fold most of large ones.
 //! A player reads its hand strength with noise; the strongest share of the read raises, the next
 //! share continues, at the rates Brasa players raise, call and fold by street, players in the
 //! hand and size faced. The raise lands on the abstract size nearest to theirs.
 
 use crate::abstraction::{preflop_bucket, AbsAction, Abstraction};
-use crate::cards::Card;
+use crate::cards::{rank, suit, Card};
 use crate::engine::{Hand, PlayerAction, Street};
 use crate::eval::eval7;
 use rand::rngs::SmallRng;
@@ -15,16 +15,20 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// The rates and read noises a Brasa player acts by. The defaults are calibrated: moment-matched
-/// so a simulated table's raise, call, fold and bet-size shares, by street, players in the hand and
-/// size faced, sit 0.45 points on average from those of Brasa's players over 19,000 opponent actions
-/// in account1's and account2's hands (2026-11-16 to 24), and 0.76 points facing bets above 1.5 pots,
-/// whose three sizes match their shares pooled over the streets (live data there is thin: 82 to 678
-/// actions a size); 40,000 simulated hands a round, blueprint A with its search at 300 ms. Read
-/// noise puts a strong hand's read below a small threshold, so the raise thresholds facing the
-/// biggest bets sit below zero. The trainer (`train --rnr-model brasa`) and
-/// the server's simulator play the same model through [`intent`]; `BRASA_MODEL`, a JSON file of
-/// this shape, replaces the defaults in both while it is calibrated against live hands.
+/// The rates and read noises a Brasa player acts by. Preflop, they are moment-matched in the simulator: a simulated
+/// table's raise, call and fold shares by position and raise faced sit within a point of those of Brasa's players.
+/// Postflop, they are fitted on Brasa's live hands read through the model (3,609 hands of account1, account2 and
+/// account3 with an opponent past the flop, 2026-11-16 to 24): each opponent's possible holes are weighted by the
+/// model's chance of the actions it took. Every context's thresholds (street, heads-up or multiway, unbet or the size
+/// faced) are set so the model's chance of each action, given what each player did before in the hand, averages the
+/// live share there; a context with under 30 live decisions takes its size's shares. The read's noise, power, share
+/// of random reads and what a hand is ranked against are those under which the 4,149 holes the players showed are
+/// likeliest. Brasa's players read their hands far more loosely than a pure strength order: they check and call with
+/// strong hands and bet with nothing; facing a bet, a tenth to a fifth of them continue whatever they hold, and above
+/// 0.8 pots the rest judge their hand against hands that make a pair. Their callers of bets above 3 pots still hold
+/// two pairs or better more often than the model's (36% of 121 shown hands, against 26%), a gap no read here closes. Raise thresholds below zero let a strong hand
+/// raise only when its read strays low. The trainer (`train --rnr-model brasa`) and the server's simulator play the
+/// same model through [`intent`]; `BRASA_MODEL`, a JSON file of this shape, replaces the defaults in both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Model {
     /// Unopened: (open, open or limp), as shares of hands.
@@ -34,19 +38,24 @@ pub struct Model {
     pub facing_raise: [[(f64, f64); 6]; 2],
     /// The big blind's raise share when the pot comes to it unraised.
     pub bb_raise: f64,
-    /// Postflop, unbet: bet shares by size (s, m, l); heads-up then multiway, by street.
+    /// Postflop, unbet: the read thresholds of the bet sizes (s, m, l); heads-up then multiway, by street.
     pub unbet: [[[f64; 3]; 3]; 2],
     /// Postflop, facing a bet, by its size against the pot before it ([`size_bucket`]: up to 0.4,
-    /// 0.8, 1.5, 3 and 6 pots, and above): (raise, continue); heads-up then multiway, by street.
+    /// 0.8, 1.5, 3 and 6 pots, and above): the read thresholds (raise, continue); heads-up then multiway, by street.
     pub facing: [[[(f64, f64); 6]; 3]; 2],
-    /// How far a player's read of its strength strays (0 strongest, 1 weakest): preflop, postflop, and postflop facing
-    /// a bet above 0.8 pots ([`BIG_BET_SIZE`]). That last one was fitted on the 176 hands Brasa's players had to show
-    /// after calling such a bet (river calls and all-in calls, 2026-11-16 to 24): it lands at 0.14 on the flop and
-    /// turn, the rest of their play's 0.12. No noise fits the river's callers: they hold more air and more two pairs
-    /// or better than the model's (top pair or better 50% against 43%), a mix no single noise reads.
+    /// How far a read strays (0 strongest, 1 weakest), as the sd of a normal noise: preflop; postflop unbet; postflop
+    /// facing each of the six sizes.
     pub preflop_noise: f64,
-    pub postflop_noise: f64,
-    pub big_bet_noise: f64,
+    pub unbet_noise: f64,
+    pub facing_noise: [f64; 6],
+    /// A postflop read is the hand's rank raised to this power before its noise: below 1, the strongest hands' reads
+    /// spread apart and the middling ones' crowd together, as if a player knew a monster but not a medium hand.
+    pub postflop_power: f64,
+    /// The share of players who, facing a postflop bet of each of the six sizes, read their hand at random.
+    pub facing_guess: [f64; 6],
+    /// From this size faced on, a player ranks its hand against the hands that make a pair or better, the ones that
+    /// bet that big, instead of against any hand.
+    pub range_from: usize,
 }
 
 impl Default for Model {
@@ -59,24 +68,27 @@ impl Default for Model {
             ],
             bb_raise: 0.145,
             unbet: [
-                [[0.089, 0.099, 0.148], [0.137, 0.112, 0.052], [0.113, 0.093, 0.111]],
-                [[0.104, 0.08, 0.065], [0.117, 0.072, 0.053], [0.127, 0.079, 0.106]],
+                [[0.103, 0.115, 0.171], [0.185, 0.152, 0.07], [0.156, 0.128, 0.153]],
+                [[0.105, 0.081, 0.066], [0.124, 0.076, 0.056], [0.129, 0.081, 0.108]],
             ],
             facing: [
                 [
-                    [(0.194, 0.711), (0.104, 0.488), (0.05, 0.462), (-0.042, 0.339), (-0.017, 0.339), (-0.047, 0.303)],
-                    [(0.111, 0.706), (0.017, 0.481), (0.027, 0.43), (-0.047, 0.306), (-0.026, 0.306), (-0.049, 0.272)],
-                    [(0.122, 0.629), (0.007, 0.448), (0.022, 0.422), (-0.048, 0.248), (-0.027, 0.248), (-0.049, 0.221)],
+                    [(0.194, 0.81), (0.163, 0.622), (0.172, 0.753), (0.218, 0.723), (-0.017, 0.644), (0.031, 0.526)],
+                    [(0.155, 0.853), (0.055, 0.63), (0.151, 0.735), (-0.08, 0.769), (0.078, 0.721), (-0.04, 0.485)],
+                    [(0.172, 0.752), (0.039, 0.61), (0.114, 0.705), (-0.096, 0.457), (0.106, 0.558), (-0.023, 0.439)],
                 ],
                 [
-                    [(0.124, 0.579), (0.047, 0.454), (0.034, 0.426), (0.001, 0.333), (-0.046, 0.298), (-0.022, 0.278)],
-                    [(0.057, 0.62), (0.029, 0.415), (0.003, 0.361), (-0.005, 0.287), (-0.048, 0.257), (-0.023, 0.239)],
-                    [(0.097, 0.49), (0.025, 0.367), (0.021, 0.286), (-0.002, 0.214), (-0.047, 0.192), (-0.023, 0.179)],
+                    [(0.143, 0.681), (0.06, 0.537), (0.133, 0.72), (0.184, 0.691), (0.078, 0.584), (-0.022, 0.513)],
+                    [(0.071, 0.724), (0.057, 0.522), (0.079, 0.659), (0.07, 0.727), (0.157, 0.65), (0.027, 0.526)],
+                    [(0.142, 0.588), (0.039, 0.437), (0.106, 0.521), (0.102, 0.545), (-0.047, 0.436), (0.035, 0.362)],
                 ],
             ],
             preflop_noise: 0.08,
-            postflop_noise: 0.12,
-            big_bet_noise: 0.12,
+            unbet_noise: 0.3,
+            facing_noise: [0.2; 6],
+            postflop_power: 0.7,
+            facing_guess: [0.2, 0.2, 0.1, 0.1, 0.1, 0.1],
+            range_from: 2,
         }
     }
 }
@@ -101,15 +113,15 @@ pub const OPEN_BB: [u32; 5] = [2, 3, 4, 5, 7];
 
 const STRENGTH_RUNOUTS: usize = 16;
 
-/// The upper bounds of the sizes a bet is faced at, in pots before it; a bet above the last is
-/// the sixth size.
-pub const FACING_POTS: [f64; 5] = [0.4, 0.8, 1.5, 3.0, 6.0];
-
 // WARNING: with every bet above 0.8 pots one size, a model player continued against a 17-pot shove
 // as often as against a pot bet, and the search shoved 130 bb into 7.5 with top pair, weak kicker
 // (account1, 2026-11-24 03:02Z); Brasa's players fold 53% of pot bets and 79% of bets above 6 pots.
-/// The first of the sizes a bet is faced at that [`Model::big_bet_noise`] reads: above 0.8 pots.
-pub const BIG_BET_SIZE: usize = 2;
+// And with a strict read, a model player who checked held almost no strong hand, so a shove into
+// checks looked safe: it still shoved 94 bb into 4 with top pair, weak kicker, into a four-way
+// limped pot (account2, 2026-11-23), where real players who check still hold two pairs and better.
+/// The upper bounds of the sizes a bet is faced at, in pots before it; a bet above the last is
+/// the sixth size.
+pub const FACING_POTS: [f64; 5] = [0.4, 0.8, 1.5, 3.0, 6.0];
 
 /// A bet's size against the pot before it, as the index of the first [`FACING_POTS`] bound it is
 /// within (5 above them all).
@@ -195,6 +207,99 @@ pub fn postflop_rank(hole: [Card; 2], board: &[Card], rng: &mut SmallRng) -> f64
     1.0 - equity_vs_random(hole, board, STRENGTH_RUNOUTS, rng)
 }
 
+/// A hand category (`eval`'s: 0 high card to 8 straight flush) of 3 to 7 cards.
+fn category(cards: &[Card]) -> u32 {
+    if let Ok(seven) = <[Card; 7]>::try_from(cards) {
+        return eval7(&seven) >> 20;
+    }
+    let mut counts = [0u8; 13];
+    let mut suits = [0u8; 4];
+    let mut mask = 0u16;
+    for &c in cards {
+        counts[usize::from(rank(c))] += 1;
+        suits[usize::from(suit(c))] += 1;
+        mask |= 1 << rank(c);
+    }
+    let flush = suits.iter().any(|&n| n >= 5);
+    let straight = mask & 0b1_0000_0000_1111 == 0b1_0000_0000_1111 || (0..=8).any(|lo| (mask >> lo) & 0b11111 == 0b11111);
+    let trips = counts.iter().filter(|&&n| n == 3).count();
+    let pairs = counts.iter().filter(|&&n| n == 2).count();
+    match () {
+        _ if straight && flush => 8,
+        _ if counts.contains(&4) => 7,
+        _ if trips >= 1 && (pairs >= 1 || trips >= 2) => 6,
+        _ if flush => 5,
+        _ if straight => 4,
+        _ if trips >= 1 => 3,
+        _ if pairs >= 2 => 2,
+        _ if pairs == 1 => 1,
+        _ => 0,
+    }
+}
+
+/// Whether `hole` makes a pair or better of its own on `board`: the board's own pairs, trips, straight or flush don't
+/// count.
+fn makes_a_pair(hole: [Card; 2], board: &[Card]) -> bool {
+    let mut all = [0 as Card; 7];
+    all[..board.len()].copy_from_slice(board);
+    all[board.len()..board.len() + 2].copy_from_slice(&hole);
+    let cat = category(&all[..board.len() + 2]);
+    let board_cat = category(board);
+    let pocket = rank(hole[0]) == rank(hole[1]);
+    let hits = hole.iter().any(|&c| board.iter().any(|&b| rank(b) == rank(c)));
+    match cat {
+        0 => false,
+        1 | 2 => pocket || hits || board_cat == 0,
+        3 => pocket || hits,
+        _ => !(board.len() == 5 && board_cat >= 4 && cat == board_cat),
+    }
+}
+
+/// Random holes drawn for one that makes a pair before [`postflop_rank_vs_pairs`] gives up on the board.
+const PAIR_DRAWS: usize = 400;
+
+/// [`postflop_rank`] against a hand that makes a pair or better on the board instead of any hand; against any hand
+/// on a board where hardly any does (a straight or flush on the board that few holes beat with a better category).
+pub fn postflop_rank_vs_pairs(hole: [Card; 2], board: &[Card], rng: &mut SmallRng) -> f64 {
+    let mut used = [false; 52];
+    for &c in hole.iter().chain(board) {
+        used[c as usize] = true;
+    }
+    let live: Vec<Card> = (0..52u8).filter(|&c| !used[c as usize]).collect();
+    let mut won = 0.0;
+    let mut pick = [0 as Card; 7];
+    for _ in 0..STRENGTH_RUNOUTS {
+        let drawn = (0..PAIR_DRAWS).find_map(|_| {
+            let (a, b) = (live[rng.random_range(0..live.len())], live[rng.random_range(0..live.len())]);
+            (a != b && makes_a_pair([a, b], board)).then_some([a, b])
+        });
+        let Some(opp) = drawn else {
+            return postflop_rank(hole, board, rng);
+        };
+        let mut full = [0 as Card; 5];
+        full[..board.len()].copy_from_slice(board);
+        let mut n = board.len();
+        while n < 5 {
+            let c = live[rng.random_range(0..live.len())];
+            if !opp.contains(&c) && !full[board.len()..n].contains(&c) {
+                full[n] = c;
+                n += 1;
+            }
+        }
+        pick[..5].copy_from_slice(&full);
+        pick[5..].copy_from_slice(&hole);
+        let ours = eval7(&pick);
+        pick[5..].copy_from_slice(&opp);
+        let theirs = eval7(&pick);
+        won += match ours.cmp(&theirs) {
+            std::cmp::Ordering::Greater => 1.0,
+            std::cmp::Ordering::Equal => 0.5,
+            std::cmp::Ordering::Less => 0.0,
+        };
+    }
+    1.0 - won / STRENGTH_RUNOUTS as f64
+}
+
 /// What a Brasa player at `h` (its seat `h.to_act()`) means to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -252,10 +357,9 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
         Street::Turn => 1,
         _ => 2,
     };
-    let rank = postflop_rank(h.hole(p), h.board(), rng);
     let pot = f64::from(h.pot());
     if h.to_call() == 0 {
-        let r = read(rank, m.postflop_noise, rng);
+        let r = read(postflop_rank(h.hole(p), h.board(), rng).max(0.0).powf(m.postflop_power), m.unbet_noise, rng);
         let rates = m.unbet[table][st];
         if r >= rates.iter().sum::<f64>() {
             return Intent::CheckCall;
@@ -272,7 +376,12 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
     let bet = f64::from(h.to_call());
     let size = size_bucket(bet / (pot - bet).max(1.0));
     let (raise, cont) = m.facing[table][st][size];
-    let r = read(rank, if size >= BIG_BET_SIZE { m.big_bet_noise } else { m.postflop_noise }, rng);
+    let r = if rng.random::<f64>() < m.facing_guess[size] {
+        rng.random::<f64>()
+    } else {
+        let strength = if size >= m.range_from { postflop_rank_vs_pairs } else { postflop_rank };
+        read(strength(h.hole(p), h.board(), rng).max(0.0).powf(m.postflop_power), m.facing_noise[size], rng)
+    };
     if r >= cont {
         Intent::Fold
     } else if r >= raise {
@@ -408,15 +517,46 @@ mod tests {
     }
 
     #[test]
-    fn a_bet_above_the_pot_is_read_with_its_own_noise() {
+    fn each_size_faced_is_read_with_its_own_noise() {
         // 7-3 offsuit on K-9-2: no pair and no draw.
-        let quiet = Model { postflop_noise: 0.0, big_bet_noise: 0.0, ..Model::default() };
-        let loose = Model { big_bet_noise: 0.6, ..quiet.clone() };
+        let quiet = Model { facing_noise: [0.0; 6], facing_guess: [0.0; 6], ..Model::default() };
+        let loose = Model { facing_noise: [0.0, 0.0, 0.0, 0.6, 0.0, 0.0], ..quiet.clone() };
         let half_pot = facing_flop_bet_with("7s 3h", 100);
         let two_pots = facing_flop_bet_with("7s 3h", 400);
         assert_eq!(continue_share(&loose, &half_pot, 2000), continue_share(&quiet, &half_pot, 2000));
         let (q, l) = (continue_share(&quiet, &two_pots, 2000), continue_share(&loose, &two_pots, 2000));
         assert!(l > q + 0.1, "continues two pots read quietly {q}, loosely {l}");
+    }
+
+    #[test]
+    fn a_share_of_players_facing_a_bet_continue_whatever_they_hold() {
+        let quiet = Model { facing_noise: [0.0; 6], facing_guess: [0.0; 6], ..Model::default() };
+        let guessing = Model { facing_guess: [0.5; 6], ..quiet.clone() };
+        let shove = facing_flop_bet_with("7s 3h", 2000);
+        let (q, g) = (continue_share(&quiet, &shove, 2000), continue_share(&guessing, &shove, 2000));
+        assert!(q < 0.02 && g > 0.1, "continues a ten-pot shove with air read strictly {q}, half at random {g}");
+    }
+
+    #[test]
+    fn top_pair_weak_kicker_ranks_lower_against_hands_that_make_a_pair() {
+        let cards = parse_cards("Ah 3s As Js 2d").expect("cards parse");
+        let (hole, board) = ([cards[0], cards[1]], &cards[2..]);
+        let mut rng = SmallRng::seed_from_u64(17);
+        let mean = |f: fn([Card; 2], &[Card], &mut SmallRng) -> f64, rng: &mut SmallRng| (0..400).map(|_| f(hole, board, rng)).sum::<f64>() / 400.0;
+        let (any, pairs) = (mean(postflop_rank, &mut rng), mean(postflop_rank_vs_pairs, &mut rng));
+        assert!(any < 0.2 && pairs > any + 0.1, "A3 on A-J-2 ranks {any} against any hand, {pairs} against a pair");
+        let set = parse_cards("2h 2s").expect("cards parse");
+        assert!(makes_a_pair([set[0], set[1]], board) && !makes_a_pair([cards[1], parse_cards("Kd").expect("card")[0]], board));
+    }
+
+    // WARNING: on 5-6-7-8-9 offsuit no hole makes a pair of its own, and drawing until one did never
+    // ended: a 20,000-hand simulation hung at hand 13,800 (2026-11-24 22:52).
+    #[test]
+    fn a_board_no_hole_pairs_ranks_against_any_hand() {
+        let cards = parse_cards("Ah Kd 5s 6h 7d 8c 9s").expect("cards parse");
+        let mut rng = SmallRng::seed_from_u64(19);
+        let r = postflop_rank_vs_pairs([cards[0], cards[1]], &cards[2..], &mut rng);
+        assert!((0.0..=1.0).contains(&r));
     }
 
     #[test]
