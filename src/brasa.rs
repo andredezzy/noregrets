@@ -24,9 +24,12 @@ use std::sync::OnceLock;
 /// live share there; a context with under 30 live decisions takes its size's shares. The read's noise, power, share
 /// of random reads and what a hand is ranked against are those under which the 4,149 holes the players showed are
 /// likeliest. Brasa's players read their hands far more loosely than a pure strength order: they check and call with
-/// strong hands and bet with nothing; facing a bet, a tenth to a fifth of them continue whatever they hold, and above
-/// 0.8 pots the rest judge their hand against hands that make a pair. Their callers of bets above 3 pots still hold
-/// two pairs or better more often than the model's (36% of 121 shown hands, against 26%), a gap no read here closes. Raise thresholds below zero let a strong hand
+/// strong hands and bet with nothing; facing a bet up to 3 pots, a tenth to a fifth of them continue whatever they
+/// hold, and above 0.8 pots the rest judge their hand against hands that make a pair. Facing 3 pots or more, the read
+/// is the one under which the callers' shown hands come closest to the live ones: sharp (noise 0.05), with a
+/// twentieth calling 3 to 6 pots whatever they hold, none calling more on a guess, and no one raising on a guess. Their
+/// callers there hold two pairs or better in 32% of the model's hands against 36% of 121 shown (26% under the likeliest
+/// read, which no read structure here lifts past 33%), and their raisers 82% against 91% of 11. Raise thresholds below zero let a strong hand
 /// raise only when its read strays low. The trainer (`train --rnr-model brasa`) and the server's simulator play the
 /// same model through [`intent`]; `BRASA_MODEL`, a JSON file of this shape, replaces the defaults in both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +59,9 @@ pub struct Model {
     /// From this size faced on, a player ranks its hand against the hands that make a pair or better, the ones that
     /// bet that big, instead of against any hand.
     pub range_from: usize,
+    /// From this size faced on, the players who read at random only call or fold: none raises a bet of 3 pots or
+    /// more on a guess.
+    pub guess_calls_from: usize,
 }
 
 impl Default for Model {
@@ -68,27 +74,28 @@ impl Default for Model {
             ],
             bb_raise: 0.145,
             unbet: [
-                [[0.103, 0.115, 0.171], [0.185, 0.152, 0.07], [0.156, 0.128, 0.153]],
+                [[0.103, 0.115, 0.171], [0.184, 0.152, 0.07], [0.155, 0.127, 0.152]],
                 [[0.105, 0.081, 0.066], [0.124, 0.076, 0.056], [0.129, 0.081, 0.108]],
             ],
             facing: [
                 [
-                    [(0.194, 0.81), (0.163, 0.622), (0.172, 0.753), (0.218, 0.723), (-0.017, 0.644), (0.031, 0.526)],
-                    [(0.155, 0.853), (0.055, 0.63), (0.151, 0.735), (-0.08, 0.769), (0.078, 0.721), (-0.04, 0.485)],
-                    [(0.172, 0.752), (0.039, 0.61), (0.114, 0.705), (-0.096, 0.457), (0.106, 0.558), (-0.023, 0.439)],
+                    [(0.194, 0.81), (0.163, 0.622), (0.172, 0.753), (0.218, 0.723), (-0.017, 0.711), (0.179, 0.643)],
+                    [(0.154, 0.852), (0.055, 0.63), (0.151, 0.735), (-0.081, 0.768), (0.195, 0.804), (0.053, 0.58)],
+                    [(0.171, 0.751), (0.039, 0.609), (0.114, 0.703), (-0.096, 0.457), (0.183, 0.616), (0.036, 0.515)],
                 ],
                 [
-                    [(0.143, 0.681), (0.06, 0.537), (0.133, 0.72), (0.184, 0.691), (0.078, 0.584), (-0.022, 0.513)],
-                    [(0.071, 0.724), (0.057, 0.522), (0.079, 0.659), (0.07, 0.727), (0.157, 0.65), (0.027, 0.526)],
-                    [(0.142, 0.588), (0.039, 0.437), (0.106, 0.521), (0.102, 0.545), (-0.047, 0.436), (0.035, 0.362)],
+                    [(0.143, 0.681), (0.06, 0.537), (0.133, 0.72), (0.184, 0.691), (0.237, 0.672), (-0.022, 0.632)],
+                    [(0.071, 0.724), (0.057, 0.522), (0.079, 0.659), (0.07, 0.727), (0.317, 0.751), (0.12, 0.661)],
+                    [(0.141, 0.588), (0.039, 0.437), (0.106, 0.521), (0.102, 0.544), (-0.047, 0.496), (0.116, 0.471)],
                 ],
             ],
             preflop_noise: 0.08,
             unbet_noise: 0.3,
-            facing_noise: [0.2; 6],
+            facing_noise: [0.2, 0.2, 0.2, 0.2, 0.05, 0.05],
             postflop_power: 0.7,
-            facing_guess: [0.2, 0.2, 0.1, 0.1, 0.1, 0.1],
+            facing_guess: [0.2, 0.2, 0.1, 0.1, 0.05, 0.0],
             range_from: 2,
+            guess_calls_from: 4,
         }
     }
 }
@@ -376,7 +383,8 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
     let bet = f64::from(h.to_call());
     let size = size_bucket(bet / (pot - bet).max(1.0));
     let (raise, cont) = m.facing[table][st][size];
-    let r = if rng.random::<f64>() < m.facing_guess[size] {
+    let guess = rng.random::<f64>() < m.facing_guess[size];
+    let r = if guess {
         rng.random::<f64>()
     } else {
         let strength = if size >= m.range_from { postflop_rank_vs_pairs } else { postflop_rank };
@@ -384,7 +392,7 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
     };
     if r >= cont {
         Intent::Fold
-    } else if r >= raise {
+    } else if r >= raise || (guess && size >= m.guess_calls_from) {
         Intent::CheckCall
     } else {
         Intent::RaiseTo(h.current_bet() * 3)
@@ -535,6 +543,18 @@ mod tests {
         let shove = facing_flop_bet_with("7s 3h", 2000);
         let (q, g) = (continue_share(&quiet, &shove, 2000), continue_share(&guessing, &shove, 2000));
         assert!(q < 0.02 && g > 0.1, "continues a ten-pot shove with air read strictly {q}, half at random {g}");
+    }
+
+    #[test]
+    fn no_one_raises_a_bet_of_three_pots_or_more_on_a_guess() {
+        let guessing = Model { facing_guess: [1.0; 6], ..Model::default() };
+        let raises = |h: &Hand| {
+            let mut rng = SmallRng::seed_from_u64(23);
+            (0..2000).filter(|_| matches!(intent_by(&guessing, h, &mut rng), Intent::RaiseTo(_))).count()
+        };
+        // 7-3 offsuit on A-Q-K: a random read raises a pot bet now and then, never a ten-pot shove.
+        assert!(raises(&facing_flop_bet_with("7s 3h", 200)) > 0);
+        assert_eq!(raises(&facing_flop_bet_with("7s 3h", 2000)), 0);
     }
 
     #[test]
