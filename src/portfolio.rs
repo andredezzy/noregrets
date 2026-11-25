@@ -92,7 +92,7 @@ pub fn run_portfolio_eval(
             let a = if p == hero {
                 policy.act_blueprint(&table.shadow, &table.hist, &mut rng)
             } else {
-                baseline_action(baseline, &table.shadow, &policy.abs, &mut rng)
+                baseline_action(baseline, &table.shadow, hero, &policy.abs, &mut rng)
             };
             table.apply_abs(a, &policy.abs);
         }

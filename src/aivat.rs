@@ -200,7 +200,7 @@ fn play_one_aivat(
             let idx = crate::cfr::sample_index(&probs, rng);
             (acts[idx], Some((acts, probs, idx)))
         } else {
-            let a = baseline_action(baseline, &table.shadow, &policy.abs, rng);
+            let a = baseline_action(baseline, &table.shadow, hero, &policy.abs, rng);
             match baseline {
                 Baseline::Random => {
                     let acts = policy.abs.abstract_actions(&table.shadow);

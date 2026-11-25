@@ -804,7 +804,7 @@ impl Trainer {
                 }
             } else {
                 let model = self.rnr.as_ref().expect("model_opp without rnr").model;
-                let a = crate::table::baseline_action(model, h, &self.abs, rng);
+                let a = crate::table::baseline_action(model, h, traverser, &self.abs, rng);
                 if acts.contains(&a) {
                     a
                 } else {
@@ -1026,7 +1026,7 @@ impl Trainer {
             let acts = lc.abs.abstract_actions(&h);
             let a = match model {
                 Some(m) if p != traverser => {
-                    let a = crate::table::baseline_action(m, &h, &lc.abs, rng);
+                    let a = crate::table::baseline_action(m, &h, traverser, &lc.abs, rng);
                     if acts.contains(&a) { a } else { acts[0] }
                 }
                 _ => {

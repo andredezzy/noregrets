@@ -17,8 +17,8 @@ use std::sync::OnceLock;
 
 /// The rates and read noises a Brasa player acts by. Preflop, they are moment-matched in the simulator: a simulated
 /// table's raise, call and fold shares by position and raise faced sit within a point of those of Brasa's players.
-/// Postflop, they are fitted on Brasa's live hands read through the model (3,609 hands of account1, account2 and
-/// account3 with an opponent past the flop, 2026-11-16 to 24): each opponent's possible holes are weighted by the
+/// Postflop, they are fitted on Brasa's live hands read through the model (3,634 hands of account1, account2 and
+/// account3 with an opponent past the flop, 2026-11-16 to 25): each opponent's possible holes are weighted by the
 /// model's chance of the actions it took. Every context's thresholds (street, heads-up or multiway, unbet or the size
 /// faced) are set so the model's chance of each action, given what each player did before in the hand, averages the
 /// live share there; a context with under 30 live decisions takes its size's shares. The read's noise, power, share
@@ -29,7 +29,11 @@ use std::sync::OnceLock;
 /// is the one under which the callers' shown hands come closest to the live ones: sharp (noise 0.05), with a
 /// twentieth calling 3 to 6 pots whatever they hold, none calling more on a guess, and no one raising on a guess. Their
 /// callers there hold two pairs or better in 32% of the model's hands against 36% of 121 shown (26% under the likeliest
-/// read, which no read structure here lifts past 33%), and their raisers 82% against 91% of 11. Raise thresholds below zero let a strong hand
+/// read, which no read structure here lifts past 33%), and their raisers 82% against 91% of 11. Facing the bot's own bets of up to 3 pots they continue more than facing each
+/// other's (45% against 32% at 1.5 to 3 pots): those spots have thresholds of their own (`facing_bot`), fitted on the
+/// 2,503 decisions facing them, each pulled toward the share facing anyone else with the weight of 3 decisions.
+/// Bigger bets of the bot are faced as anyone else's: 26 decisions cannot tell both how often and with what players
+/// call them. Raise thresholds below zero let a strong hand
 /// raise only when its read strays low. The trainer (`train --rnr-model brasa`) and the server's simulator play the
 /// same model through [`intent`]; `BRASA_MODEL`, a JSON file of this shape, replaces the defaults in both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +50,9 @@ pub struct Model {
     /// Postflop, facing a bet, by its size against the pot before it ([`size_bucket`]: up to 0.4,
     /// 0.8, 1.5, 3 and 6 pots, and above): the read thresholds (raise, continue); heads-up then multiway, by street.
     pub facing: [[[(f64, f64); 6]; 3]; 2],
+    /// The same, facing a bet the bot made (the seat the model plays against): Brasa's players continue more against
+    /// the bot's bets of up to 3 pots than against each other's; above that the thresholds are `facing`'s.
+    pub facing_bot: [[[(f64, f64); 6]; 3]; 2],
     /// How far a read strays (0 strongest, 1 weakest), as the sd of a normal noise: preflop; postflop unbet; postflop
     /// facing each of the six sizes.
     pub preflop_noise: f64,
@@ -74,19 +81,31 @@ impl Default for Model {
             ],
             bb_raise: 0.145,
             unbet: [
-                [[0.103, 0.115, 0.171], [0.184, 0.152, 0.07], [0.155, 0.127, 0.152]],
+                [[0.102, 0.114, 0.17], [0.183, 0.151, 0.069], [0.156, 0.128, 0.153]],
                 [[0.105, 0.081, 0.066], [0.124, 0.076, 0.056], [0.129, 0.081, 0.108]],
             ],
             facing: [
                 [
-                    [(0.194, 0.81), (0.163, 0.622), (0.172, 0.753), (0.218, 0.723), (-0.017, 0.711), (0.179, 0.643)],
-                    [(0.154, 0.852), (0.055, 0.63), (0.151, 0.735), (-0.081, 0.768), (0.195, 0.804), (0.053, 0.58)],
-                    [(0.171, 0.751), (0.039, 0.609), (0.114, 0.703), (-0.096, 0.457), (0.183, 0.616), (0.036, 0.515)],
+                    [(0.195, 0.811), (0.169, 0.614), (0.208, 0.764), (0.189, 0.681), (-0.017, 0.731), (0.187, 0.621)],
+                    [(0.162, 0.85), (0.001, 0.597), (0.053, 0.733), (0.0, 0.727), (0.195, 0.804), (0.069, 0.563)],
+                    [(0.178, 0.753), (0.018, 0.591), (0.089, 0.688), (-0.076, 0.53), (0.181, 0.586), (0.036, 0.514)],
                 ],
                 [
-                    [(0.143, 0.681), (0.06, 0.537), (0.133, 0.72), (0.184, 0.691), (0.237, 0.672), (-0.022, 0.632)],
-                    [(0.071, 0.724), (0.057, 0.522), (0.079, 0.659), (0.07, 0.727), (0.317, 0.751), (0.12, 0.661)],
-                    [(0.141, 0.588), (0.039, 0.437), (0.106, 0.521), (0.102, 0.544), (-0.047, 0.496), (0.116, 0.471)],
+                    [(0.149, 0.689), (0.05, 0.536), (0.133, 0.722), (0.04, 0.62), (0.254, 0.692), (-0.022, 0.604)],
+                    [(0.074, 0.725), (0.046, 0.516), (0.068, 0.621), (0.125, 0.681), (0.318, 0.751), (0.125, 0.642)],
+                    [(0.142, 0.591), (0.046, 0.44), (0.138, 0.541), (0.121, 0.553), (-0.047, 0.52), (0.116, 0.471)],
+                ],
+            ],
+            facing_bot: [
+                [
+                    [(0.141, 0.844), (0.158, 0.647), (0.122, 0.74), (0.244, 0.764), (-0.017, 0.731), (0.187, 0.621)],
+                    [(-0.112, 0.981), (0.172, 0.719), (0.216, 0.737), (-0.298, 0.818), (0.195, 0.804), (0.069, 0.563)],
+                    [(-0.095, 0.678), (0.101, 0.724), (0.163, 0.732), (-0.3, 0.268), (0.181, 0.586), (0.036, 0.514)],
+                ],
+                [
+                    [(0.05, 0.583), (0.084, 0.543), (0.131, 0.715), (0.249, 0.73), (0.254, 0.692), (-0.022, 0.604)],
+                    [(0.025, 0.692), (0.098, 0.543), (0.09, 0.709), (-0.02, 0.801), (0.318, 0.751), (0.125, 0.642)],
+                    [(0.166, 0.626), (0.032, 0.438), (-0.242, 0.387), (-0.113, 0.493), (-0.047, 0.52), (0.116, 0.471)],
                 ],
             ],
             preflop_noise: 0.08,
@@ -318,15 +337,15 @@ pub enum Intent {
 }
 
 /// The decision of a Brasa player at `h`: the strongest share of its noisy read raises, the next
-/// share continues, at the model's rates for the street, the players in the hand and the size
-/// faced.
-pub fn intent(h: &Hand, rng: &mut SmallRng) -> Intent {
-    intent_by(model(), h, rng)
+/// share continues, at the model's rates for the street, the players in the hand, the size faced
+/// and whether the bet faced is the bot's (`bot`, the seat the model plays against).
+pub fn intent(h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent {
+    intent_by(model(), h, bot, rng)
 }
 
 /// [`intent`] by the rates of `m`: a player who acts unlike the model in play (the simulator's
 /// opponents, to test what the model's errors cost).
-pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
+pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent {
     let p = h.to_act();
     let bb = h.big_blind();
     if h.street() == Street::Preflop {
@@ -382,7 +401,8 @@ pub fn intent_by(m: &Model, h: &Hand, rng: &mut SmallRng) -> Intent {
     }
     let bet = f64::from(h.to_call());
     let size = size_bucket(bet / (pot - bet).max(1.0));
-    let (raise, cont) = m.facing[table][st][size];
+    let facing = if h.aggressor() == Some(bot) { &m.facing_bot } else { &m.facing };
+    let (raise, cont) = facing[table][st][size];
     let guess = rng.random::<f64>() < m.facing_guess[size];
     let r = if guess {
         rng.random::<f64>()
@@ -421,9 +441,9 @@ fn fold_or_check(h: &Hand, acts: &[AbsAction]) -> AbsAction {
 
 /// The action a Brasa player takes at `h` on the abstraction's menu: its [`intent`], a raise
 /// landing on the abstract size nearest to its own.
-pub fn action(h: &Hand, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
+pub fn action(h: &Hand, bot: usize, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
     let acts = abs.abstract_actions(h);
-    match intent(h, rng) {
+    match intent(h, bot, rng) {
         Intent::Fold => fold_or_check(h, &acts),
         Intent::CheckCall => AbsAction::CheckCall,
         Intent::RaiseTo(target) => nearest_raise(h, &acts, abs, target),
@@ -436,6 +456,9 @@ mod tests {
     use crate::abstraction::AbsConfig;
     use crate::cards::parse_cards;
     use crate::engine::HandConfig;
+
+    /// A bot seat no one at these tables holds: every bet faced is another player's.
+    const NO_BOT: usize = usize::MAX;
 
     fn abs() -> Abstraction {
         Abstraction::new(AbsConfig {
@@ -461,7 +484,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(7);
         let (mut fold, mut call, mut raise) = (0, 0, 0);
         for _ in 0..n {
-            match action(h, &abs, &mut rng) {
+            match action(h, NO_BOT, &abs, &mut rng) {
                 AbsAction::Fold => fold += 1,
                 AbsAction::CheckCall => call += 1,
                 _ => raise += 1,
@@ -507,7 +530,7 @@ mod tests {
 
     fn fold_share(h: &Hand, n: usize) -> f64 {
         let mut rng = SmallRng::seed_from_u64(11);
-        let folds = (0..n).filter(|_| intent(h, &mut rng) == Intent::Fold).count();
+        let folds = (0..n).filter(|_| intent(h, NO_BOT, &mut rng) == Intent::Fold).count();
         folds as f64 / n as f64
     }
 
@@ -520,7 +543,7 @@ mod tests {
 
     fn continue_share(m: &Model, h: &Hand, n: usize) -> f64 {
         let mut rng = SmallRng::seed_from_u64(13);
-        let goes_on = (0..n).filter(|_| intent_by(m, h, &mut rng) != Intent::Fold).count();
+        let goes_on = (0..n).filter(|_| intent_by(m, h, NO_BOT, &mut rng) != Intent::Fold).count();
         goes_on as f64 / n as f64
     }
 
@@ -546,11 +569,24 @@ mod tests {
     }
 
     #[test]
+    fn a_bet_of_the_bot_is_faced_by_its_own_thresholds() {
+        // Facing the bot, everyone continues; facing anyone else, no one does.
+        let m = Model { facing: [[[(-1.0, -1.0); 6]; 3]; 2], facing_bot: [[[(-1.0, 2.0); 6]; 3]; 2], facing_guess: [0.0; 6], ..Model::default() };
+        let shove = facing_flop_bet_with("7s 3h", 2000);
+        let bettor = shove.aggressor().expect("someone bet");
+        let goes_on = |bot: usize| {
+            let mut rng = SmallRng::seed_from_u64(29);
+            (0..200).filter(|_| intent_by(&m, &shove, bot, &mut rng) != Intent::Fold).count()
+        };
+        assert_eq!((goes_on(bettor), goes_on(NO_BOT)), (200, 0));
+    }
+
+    #[test]
     fn no_one_raises_a_bet_of_three_pots_or_more_on_a_guess() {
         let guessing = Model { facing_guess: [1.0; 6], ..Model::default() };
         let raises = |h: &Hand| {
             let mut rng = SmallRng::seed_from_u64(23);
-            (0..2000).filter(|_| matches!(intent_by(&guessing, h, &mut rng), Intent::RaiseTo(_))).count()
+            (0..2000).filter(|_| matches!(intent_by(&guessing, h, NO_BOT, &mut rng), Intent::RaiseTo(_))).count()
         };
         // 7-3 offsuit on A-Q-K: a random read raises a pot bet now and then, never a ten-pot shove.
         assert!(raises(&facing_flop_bet_with("7s 3h", 200)) > 0);

@@ -175,10 +175,11 @@ impl std::str::FromStr for Baseline {
     }
 }
 
-pub fn baseline_action(b: Baseline, h: &Hand, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
+/// A baseline opponent's action at `h` against `bot`, the seat being evaluated or trained.
+pub fn baseline_action(b: Baseline, h: &Hand, bot: usize, abs: &Abstraction, rng: &mut SmallRng) -> AbsAction {
     match b {
         Baseline::Caller => AbsAction::CheckCall,
-        Baseline::Brasa => crate::brasa::action(h, abs, rng),
+        Baseline::Brasa => crate::brasa::action(h, bot, abs, rng),
         Baseline::Random => {
             let acts = abs.abstract_actions(h);
             acts[rng.random_range(0..acts.len())]
@@ -215,7 +216,7 @@ fn play_one(
         let a = if p == hero {
             policy.act_blueprint(&table.shadow, &table.hist, rng)
         } else {
-            baseline_action(baseline, &table.shadow, &policy.abs, rng)
+            baseline_action(baseline, &table.shadow, hero, &policy.abs, rng)
         };
         table.apply_abs(a, &policy.abs);
     }
@@ -351,7 +352,7 @@ pub fn run_eval_search(
                         &mut rng,
                     )
                 } else {
-                    baseline_action(baseline, &table.shadow, &policy.abs, &mut rng)
+                    baseline_action(baseline, &table.shadow, hero, &policy.abs, &mut rng)
                 };
                 tracker.observe(p, a, &table.shadow, &table.hist, &policy.blueprint, &policy.abs);
                 let street_before = table.real.street();

@@ -80,6 +80,8 @@ pub struct Hand {
     current_bet: u32,
     min_raise_inc: u32,
     n_raises: u8,
+    /// The seat whose bet or raise is the street's current bet; none before anyone bets on it (preflop, the blinds).
+    aggressor: Option<usize>,
     terminal: bool,
     /// The house's cut of every contested pot, in basis points (500 = 5%); 0 trains and plays rake free.
     rake_bp: u32,
@@ -129,6 +131,7 @@ impl Hand {
             current_bet: 0,
             min_raise_inc: cfg.bb,
             n_raises: 0,
+            aggressor: None,
             terminal: false,
             rake_bp: 0,
         };
@@ -191,6 +194,7 @@ impl Hand {
                     }
                     self.current_bet = x;
                     self.n_raises = self.n_raises.saturating_add(1);
+                    self.aggressor = Some(p);
                     self.acted[p] = true;
                 }
             },
@@ -433,6 +437,7 @@ impl Hand {
         self.current_bet = 0;
         self.min_raise_inc = self.bb;
         self.n_raises = 0;
+        self.aggressor = None;
         self.acted = [false; MAX_PLAYERS];
 
         let can_act = (0..self.n)
@@ -518,6 +523,10 @@ impl Hand {
     pub fn n_raises(&self) -> u8 {
         self.n_raises
     }
+    /// The seat whose bet or raise the player to act faces on this street, if anyone bet.
+    pub fn aggressor(&self) -> Option<usize> {
+        self.aggressor
+    }
     #[allow(dead_code)]
     pub fn big_blind(&self) -> u32 {
         self.bb
@@ -602,6 +611,21 @@ mod tests {
         assert_eq!(h.street(), Street::Preflop);
         assert_eq!(h.to_call(), 100);
         assert!(!h.is_terminal());
+    }
+
+    #[test]
+    fn the_aggressor_is_who_made_the_streets_current_bet() {
+        let mut h = Hand::new(&cfg(3), 0, fresh_deck());
+        assert_eq!(h.aggressor(), None, "the blinds are no one's bet");
+        h.apply(RaiseTo(300)); // button
+        h.apply(RaiseTo(900)); // small blind
+        assert_eq!(h.aggressor(), Some(1));
+        h.apply(CheckCall);
+        h.apply(CheckCall);
+        assert_eq!((h.street(), h.aggressor()), (Street::Flop, None));
+        h.apply(CheckCall); // small blind checks
+        h.apply(RaiseTo(500)); // big blind bets
+        assert_eq!(h.aggressor(), Some(2));
     }
 
     #[test]
