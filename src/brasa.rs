@@ -150,6 +150,25 @@ const STRENGTH_RUNOUTS: usize = 16;
 /// the sixth size.
 pub const FACING_POTS: [f64; 5] = [0.4, 0.8, 1.5, 3.0, 6.0];
 
+/// Brasa players' stacks at the start of a hand, in big blinds: every twentieth quantile of the 7,101 stacks of
+/// account1, account2 and account3's opponents (2026-11-24 to 26), the lowest raised from 0.1 to 5. Median 122;
+/// 4% under 40 and 27% over 200, so against our 100 the effective stack is ours in most hands, and a raiser
+/// we face holds under 40 in 9% of our preflop decisions.
+pub const STACK_QUANTILES_BB: [f64; 21] = [
+    5.0, 32.0, 42.9, 52.1, 63.2, 73.5, 83.6, 94.0, 100.0, 107.2, 121.8, 137.9, 154.5, 168.4, 190.3, 213.0, 247.6,
+    300.1, 387.2, 531.9, 1317.2,
+];
+
+/// A Brasa player's stack in chips at `bb` chips a big blind, at the share `u` (in [0, 1)) of
+/// [`STACK_QUANTILES_BB`], linearly between its quantiles.
+pub fn stack_at(u: f64, bb: u32) -> u32 {
+    let steps = (STACK_QUANTILES_BB.len() - 1) as f64;
+    let at = (u.clamp(0.0, 1.0) * steps).min(steps - 1e-9);
+    let i = at.floor() as usize;
+    let (lo, hi) = (STACK_QUANTILES_BB[i], STACK_QUANTILES_BB[i + 1]);
+    ((lo + (hi - lo) * (at - i as f64)) * f64::from(bb)).round() as u32
+}
+
 /// A bet's size against the pot before it, as the index of the first [`FACING_POTS`] bound it is
 /// within (5 above them all).
 pub fn size_bucket(pots: f64) -> usize {
@@ -497,6 +516,18 @@ mod tests {
         }
         let n = n as f64;
         (f64::from(fold) / n, f64::from(call) / n, f64::from(raise) / n)
+    }
+
+    #[test]
+    fn brasa_stacks_are_drawn_between_their_quantiles() {
+        assert_eq!(stack_at(0.0, 100), 500);
+        assert_eq!(stack_at(0.4, 100), 10_000);
+        assert_eq!(stack_at(0.425, 100), 10_360);
+        assert_eq!(stack_at(1.0, 100), 131_720);
+        let mut rng = SmallRng::seed_from_u64(7);
+        let drawn: Vec<u32> = (0..20_000).map(|_| stack_at(rng.random(), 100)).collect();
+        let under_40 = drawn.iter().filter(|&&s| s < 4_000).count() as f64 / drawn.len() as f64;
+        assert!((0.06..0.12).contains(&under_40), "{under_40}");
     }
 
     #[test]
