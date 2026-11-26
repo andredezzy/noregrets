@@ -70,6 +70,19 @@ pub struct Model {
     /// From this size faced on, the players who read at random only call or fold: none raises a bet of 3 pots or
     /// more on a guess.
     pub guess_calls_from: usize,
+    /// Preflop, facing a raise with an effective stack under [`SHORT_STACK_BB`]: the share who shove whatever they
+    /// hold. Live (24-26/11) such stacks re-raise as often as deep ones, about 7%, but the 64 who showed held hands of
+    /// median rank 0.24 against 0.10: about half their shoves are any two cards.
+    #[serde(default = "short_shove_default")]
+    pub short_shove: f64,
+}
+
+/// Below this effective stack (the player's chips against the raiser's, in big blinds) a Brasa player facing a raise
+/// may shove any two cards ([`Model::short_shove`]).
+pub const SHORT_STACK_BB: u32 = 25;
+
+fn short_shove_default() -> f64 {
+    0.03
 }
 
 impl Default for Model {
@@ -116,6 +129,7 @@ impl Default for Model {
             facing_guess: [0.2, 0.2, 0.1, 0.1, 0.05, 0.02],
             range_from: 2,
             guess_calls_from: 4,
+            short_shove: short_shove_default(),
         }
     }
 }
@@ -137,6 +151,39 @@ pub const RAISE_SIZES_BB: [u32; 5] = [3, 6, 12, 25, 50];
 /// The pot fractions their bets of size s, m and l stand for, and their opens in big blinds.
 pub const BET_POTS: [f64; 3] = [0.33, 0.6, 1.0];
 pub const OPEN_BB: [u32; 5] = [2, 3, 4, 5, 7];
+
+// WARNING: with every re-raise past the 3-bet an all-in, the model never made the min-raise wars Brasa's players make
+// (7.3% of live hands hold two or more of their raises preflop, 1.1% three or more: 3, 11.5, 20, 30, 42 bb), so the
+// training never met those lines (2026-11-26).
+/// Brasa's 3-bets (612 live, 24-26/11): the share that goes all in, then the others as multiples of the bet they
+/// raise, at their 10th, 25th, 50th, 75th and 90th percentiles.
+pub const THREE_BET_ALL_IN: f64 = 0.18;
+pub const THREE_BET_X: [f64; 5] = [1.57, 1.67, 2.5, 3.5, 5.0];
+/// The same for their 4-bets and later re-raises (183 live): mostly min-raises.
+pub const FOUR_BET_ALL_IN: f64 = 0.22;
+pub const FOUR_BET_X: [f64; 5] = [1.2, 1.33, 1.6, 2.5, 4.0];
+
+/// The share of live re-raises below each of the `xs` percentiles.
+const RERAISE_QUANTILES: [f64; 5] = [0.1, 0.25, 0.5, 0.75, 0.9];
+
+/// One Brasa re-raise of the street's bet: all in with the chance `all_in`, else a multiple of the bet drawn from the
+/// live percentiles `xs` (linear between them, flat beyond).
+fn reraise(h: &Hand, all_in: f64, xs: &[f64; 5], rng: &mut SmallRng) -> Intent {
+    if rng.random::<f64>() < all_in {
+        return Intent::RaiseTo(u32::MAX);
+    }
+    let u = rng.random::<f64>();
+    let q = RERAISE_QUANTILES;
+    let x = if u <= q[0] {
+        xs[0]
+    } else if u >= q[4] {
+        xs[4]
+    } else {
+        let i = (0..4).find(|&i| u <= q[i + 1]).unwrap_or(3);
+        xs[i] + (xs[i + 1] - xs[i]) * (u - q[i]) / (q[i + 1] - q[i])
+    };
+    Intent::RaiseTo((f64::from(h.current_bet()) * x).round() as u32)
+}
 
 const STRENGTH_RUNOUTS: usize = 16;
 
@@ -378,6 +425,12 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
             };
         }
         let raises = usize::from(h.n_raises());
+        if let Some(a) = h.aggressor().filter(|_| raises > 0) {
+            let chips = |s: usize| h.stack(s) + h.hand_commit(s);
+            if chips(p).min(chips(a)) < SHORT_STACK_BB * bb && rng.random::<f64>() < m.short_shove {
+                return Intent::RaiseTo(u32::MAX);
+            }
+        }
         let (raise, cont) = if raises == 0 {
             m.unopened
         } else {
@@ -392,9 +445,9 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
         } else if raises == 0 {
             Intent::RaiseTo(OPEN_BB[rng.random_range(0..OPEN_BB.len())] * bb)
         } else if raises == 1 {
-            Intent::RaiseTo(h.current_bet() * [20, 25, 30, 35][rng.random_range(0..4)] / 10)
+            reraise(h, THREE_BET_ALL_IN, &THREE_BET_X, rng)
         } else {
-            Intent::RaiseTo(u32::MAX)
+            reraise(h, FOUR_BET_ALL_IN, &FOUR_BET_X, rng)
         };
     }
     let table = usize::from(h.live_count() > 2);
@@ -567,6 +620,66 @@ mod tests {
         assert_eq!((h.street(), h.to_act(), h.pot()), (Street::Flop, 1, 200));
         h.apply(PlayerAction::RaiseTo(bet));
         h
+    }
+
+    /// The model's re-raises facing `raises` preflop raises, 2,000 draws: (all-in share, the others' multiples of the bet).
+    fn reraises(raises: usize) -> (f64, Vec<f64>) {
+        let cfg = HandConfig { num_players: 6, stack: 100_000, ..HandConfig::default() };
+        let deck: [u8; 52] = std::array::from_fn(|i| i as u8);
+        let mut h = Hand::new(&cfg, 0, deck);
+        let mut to = 300;
+        for _ in 0..raises {
+            h.apply(PlayerAction::RaiseTo(to));
+            to *= 3;
+        }
+        let bet = h.current_bet();
+        let mut rng = SmallRng::seed_from_u64(5);
+        let (xs, all_in) = if raises == 1 { (&THREE_BET_X, THREE_BET_ALL_IN) } else { (&FOUR_BET_X, FOUR_BET_ALL_IN) };
+        let draws: Vec<Intent> = (0..2000).map(|_| reraise(&h, all_in, xs, &mut rng)).collect();
+        let shoves = draws.iter().filter(|&&i| i == Intent::RaiseTo(u32::MAX)).count();
+        let others = draws.iter().filter_map(|&i| match i { Intent::RaiseTo(t) if t != u32::MAX => Some(f64::from(t) / f64::from(bet)), _ => None }).collect();
+        (shoves as f64 / 2000.0, others)
+    }
+
+    /// How often the button with 7-2 offsuit and `stack` chips shoves over a 3 bb open, 4,000 draws.
+    fn shoves_over_an_open(stack: u32) -> f64 {
+        let cards = parse_cards("7c 2d").expect("cards parse");
+        let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
+        // seat 3 (the button of a 6-max hand with the button at seat 3) holds the cards
+        deck.insert(6, cards[0]);
+        deck.insert(7, cards[1]);
+        let deck: [u8; 52] = deck.try_into().expect("52 cards");
+        let cfg = HandConfig { num_players: 6, stack: 100_000, ..HandConfig::default() };
+        let mut h = Hand::new_with_stacks(&cfg, 3, deck, &[10_000, 10_000, 10_000, stack, 10_000, 10_000]);
+        while h.to_act() != 0 {
+            h.apply(PlayerAction::Fold);
+        }
+        h.apply(PlayerAction::RaiseTo(300));
+        while h.to_act() != 3 {
+            h.apply(PlayerAction::Fold);
+        }
+        let mut rng = SmallRng::seed_from_u64(3);
+        let m = Model::default();
+        (0..4000).filter(|_| intent_by(&m, &h, NO_BOT, &mut rng) == Intent::RaiseTo(u32::MAX)).count() as f64 / 4000.0
+    }
+
+    #[test]
+    fn a_short_stack_shoves_any_two_cards_over_a_raise_now_and_then_and_a_deep_one_does_not() {
+        let short = shoves_over_an_open(2_000);
+        let deep = shoves_over_an_open(10_000);
+        assert!((short - Model::default().short_shove).abs() < 0.015, "20 bb with 7-2 shoves {short}");
+        assert!(deep < 0.005, "100 bb with 7-2 shoves {deep}");
+    }
+
+    #[test]
+    fn re_raises_past_the_three_bet_are_mostly_min_raises_as_at_brasa() {
+        let (shove3, x3) = reraises(1);
+        let (shove4, x4) = reraises(2);
+        let median = |v: &[f64]| { let mut s = v.to_vec(); s.sort_by(f64::total_cmp); s[s.len() / 2] };
+        assert!((shove3 - THREE_BET_ALL_IN).abs() < 0.03 && (shove4 - FOUR_BET_ALL_IN).abs() < 0.03, "{shove3} {shove4}");
+        assert!((median(&x3) - 2.5).abs() < 0.15, "3-bets {}", median(&x3));
+        assert!((median(&x4) - 1.6).abs() < 0.15, "4-bets {}", median(&x4));
+        assert!(x4.iter().all(|&x| (1.19..=4.01).contains(&x)), "4-bets stay between a min-raise and 4 times the bet");
     }
 
     #[test]
