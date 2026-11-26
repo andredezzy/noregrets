@@ -247,7 +247,7 @@ impl Policy {
     pub fn blueprint_dist(&self, h: &Hand, hist: &[u8], rng: &mut SmallRng) -> (Vec<AbsAction>, Vec<f64>) {
         let p = h.to_act();
         let acts = self.abs.abstract_actions(h);
-        let bucket = self.abs.bucket(h.hole(p), h.board(), rng);
+        let bucket = self.abs.key_bucket(h, h.hole(p), rng);
         let street = h.street() as usize;
         LOOKUPS[street].fetch_add(1, Ordering::Relaxed);
         if let Some(s) = self.blueprint.get(bucket, hist) {
@@ -421,7 +421,7 @@ impl Policy {
                 && r.real.street() == real.street()
                 && r.hist_len + r.actions.len() == hist.len()
         });
-        let bucket = sabs.bucket(real.hole(p), real.board(), rng);
+        let bucket = sabs.key_bucket(real, real.hole(p), rng);
         let strategy_at = |solver: &crate::cfr::Trainer| {
             let s = solver.avg_strategy(bucket, hist)?;
             let acts = solver.abs.abstract_actions(real);

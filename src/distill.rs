@@ -110,11 +110,7 @@ pub fn collect(policy: &Policy, cfg: &HandConfig, dcfg: &DistillCfg) -> (Records
                     let full = policy.abs.abstract_actions(&table.real);
                     if let Some(expanded) = expand_dist(&acts, &probs, &full) {
                         let mut krng = SmallRng::seed_from_u64(0xD157_5EED);
-                        let bucket = policy.abs.bucket(
-                            table.real.hole(p),
-                            table.real.board(),
-                            &mut krng,
-                        );
+                        let bucket = policy.abs.key_bucket(&table.real, table.real.hole(p), &mut krng);
                         let key = make_key(bucket, &table.hist).to_vec();
                         let mut e =
                             records.entry(key).or_insert((vec![0.0; expanded.len()], 0.0));

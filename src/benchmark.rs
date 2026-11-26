@@ -248,9 +248,7 @@ pub fn replay_hand(
             let acts = policy.abs.abstract_actions(&table.shadow);
             let mapped = table.map_concrete(action, &policy.abs);
             let idx = acts.iter().position(|&x| x == mapped);
-            let bucket = policy
-                .abs
-                .bucket(table.shadow.hole(seat), table.shadow.board(), &mut rng);
+            let bucket = policy.abs.key_bucket(&table.shadow, table.shadow.hole(seat), &mut rng);
             let strat = policy.blueprint.get(bucket, &table.hist);
             let (prob, top1) = match (idx, strat) {
                 (Some(i), Some(s)) if s.len() == acts.len() => {

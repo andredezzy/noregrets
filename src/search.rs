@@ -153,7 +153,6 @@ impl RangeTracker {
         let Some(idx) = acts.iter().position(|&a| a == taken) else {
             return; // off-menu action (shouldn't happen): no update
         };
-        let board = h.board().to_vec();
         let combos = &self.combos;
         let updates: Vec<f64> = self.weights[seat]
             .par_iter()
@@ -163,7 +162,7 @@ impl RangeTracker {
                     return w;
                 }
                 let mut rng = SmallRng::seed_from_u64(0xB0B0 ^ ci as u64);
-                let bucket = abs.bucket(combos[ci], &board, &mut rng);
+                let bucket = abs.key_bucket(h, combos[ci], &mut rng);
                 let p = match bp.get(bucket, hist) {
                     Some(s) if s.len() == acts.len() => (s[idx] as f64).max(OBS_FLOOR),
                     _ => 1.0, // unseen infoset: no information

@@ -112,12 +112,19 @@ impl Default for AbsConfig {
 ///   never searches preflop and so made that round's abstraction fine.
 /// - `PluribusOverbet`: `Pluribus` with first-in postflop bets of 1.5 and
 ///   3 pots as well: a search menu (`SearchParams::menu`), not a blueprint's.
+/// - `BrasaPre`: `Pluribus` postflop and a preflop for Brasa's tables, where
+///   stacks vary and raise wars go on in min-raises (2026-11-26): 3-bets of 25%,
+///   50% and 100% of the pot, 4-bets of 25%, 33% and 75%, 5- and 6-bets of 25%
+///   and 33%, then all-in alone; a preflop key also holds the effective stack's
+///   band ([`stack_band`]), and every key the raises its menu offers at that
+///   stack ([`Abstraction::key_bucket`]), so one key never meets two menus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum MenuShape {
     Wide,
     Pluribus,
     PluribusFinePre,
     PluribusOverbet,
+    BrasaPre,
 }
 
 /// K-medians cluster centers, one set per street. Two feature families
@@ -494,6 +501,12 @@ impl Abstraction {
             (MenuShape::PluribusFinePre, Street::Preflop, 1) => &[1, 2, 3, 4, 6],
             (MenuShape::PluribusFinePre, Street::Preflop, 2) => &[2, 4, 6],
             (MenuShape::PluribusFinePre, Street::Preflop, _) => &[4],
+            // Brasa's preflop: small re-raises to the sixth raise, as its raise wars go.
+            (MenuShape::BrasaPre, Street::Preflop, 0) => &[1, 2, 3, 4],
+            (MenuShape::BrasaPre, Street::Preflop, 1) => &[0, 2, 4],
+            (MenuShape::BrasaPre, Street::Preflop, 2) => &[0, 1, 3],
+            (MenuShape::BrasaPre, Street::Preflop, 3..=5) => &[0, 1],
+            (MenuShape::BrasaPre, Street::Preflop, _) => &[],
             // Every other shape shares the 2026-07 preflop menu.
             (_, Street::Preflop, 0) => &[1, 2, 3, 4],
             (_, Street::Preflop, 1) => &[2, 4, 6],
@@ -577,6 +590,33 @@ impl Abstraction {
             }
         }
         best
+    }
+
+    /// The bucket an infoset key of the player to act at `h` holds, holding `hole`: the card
+    /// [`bucket`](Self::bucket), and under [`MenuShape::BrasaPre`] also, preflop, the effective
+    /// stack's [`stack_band`], and on every street which of fold, the menu's raises and all-in the
+    /// menu offers at `h`. Those change with the stacks, and one key must name one menu.
+    pub fn key_bucket(&self, h: &Hand, hole: [Card; 2], rng: &mut SmallRng) -> u16 {
+        let card = self.bucket(hole, h.board(), rng);
+        if self.cfg.menu != MenuShape::BrasaPre {
+            return card;
+        }
+        let menu = self.bet_menu(h.street(), h.n_raises());
+        let mut offered = 0u16;
+        for a in self.abstract_actions(h) {
+            offered |= match a {
+                AbsAction::Bet(i) => menu.iter().position(|&m| m == i).map_or(0, |k| 1 << k),
+                AbsAction::Fold => 1 << 4,
+                AbsAction::AllIn => 1 << 5,
+                AbsAction::CheckCall => 0,
+            };
+        }
+        if h.street() == Street::Preflop {
+            card + 169 * (stack_band(h) + 3 * offered)
+        } else {
+            debug_assert!(card < 256, "a postflop card bucket under 256");
+            card + 256 * offered
+        }
     }
 
     /// Card bucket for a hole/board pair. Preflop: canonical 169.
@@ -727,6 +767,29 @@ impl Abstraction {
 
 /// Canonical preflop hand index in 0..169.
 /// Pairs on the diagonal, suited above it, offsuit below.
+/// Bounds (big blinds) of the effective-stack bands a [`MenuShape::BrasaPre`] preflop key holds:
+/// under 25 (shove or fold), 25 to 70, and 70 or more. Brasa's population calls alike at every
+/// stack, but a short stack re-raises far wider (2026-11-26, 5,276 hands).
+pub const STACK_BANDS_BB: [u32; 2] = [25, 70];
+
+/// The band of [`STACK_BANDS_BB`] the effective stack of the player to act falls in: its stack at
+/// the start of the hand against that of the raiser it faces, or, when no one raised, against the
+/// deepest other player still in.
+pub fn stack_band(h: &Hand) -> u16 {
+    let p = h.to_act();
+    let start = |q: usize| h.stack(q) + h.hand_commit(q);
+    let other = match h.aggressor().filter(|_| h.n_raises() > 0) {
+        Some(a) => start(a),
+        None => (0..h.num_players())
+            .filter(|&q| q != p && !h.folded(q))
+            .map(start)
+            .max()
+            .unwrap_or(0),
+    };
+    let effective = start(p).min(other) / h.big_blind().max(1);
+    STACK_BANDS_BB.iter().filter(|&&b| effective >= b).count() as u16
+}
+
 pub fn preflop_bucket(hole: [Card; 2]) -> u16 {
     let (r1, r2) = (rank(hole[0]) as u16, rank(hole[1]) as u16);
     let hi = r1.max(r2);
@@ -1275,6 +1338,66 @@ mod tests {
 
     fn h6() -> Hand {
         Hand::new(&HandConfig::default(), 0, fresh_deck())
+    }
+
+    fn brasa_pre() -> Abstraction {
+        Abstraction::new(AbsConfig { menu: MenuShape::BrasaPre, ..AbsConfig::default() })
+    }
+
+    fn six_with(stacks: [u32; 6]) -> Hand {
+        Hand::new_with_stacks(&HandConfig::default(), 0, fresh_deck(), &stacks)
+    }
+
+    #[test]
+    fn brasa_pre_raises_small_through_a_min_raise_war_and_only_jams_past_the_sixth_raise() {
+        let a = brasa_pre();
+        assert_eq!(a.bet_menu(Street::Preflop, 1), &[0, 2, 4]);
+        assert_eq!(a.bet_menu(Street::Preflop, 2), &[0, 1, 3]);
+        assert_eq!(a.bet_menu(Street::Preflop, 5), &[0, 1]);
+        assert!(a.bet_menu(Street::Preflop, 6).is_empty());
+        assert_eq!(a.bet_menu(Street::Flop, 0), abs().bet_menu(Street::Flop, 0));
+        let mut h = h6();
+        for to in [200, 300, 400, 500] {
+            h.apply(PlayerAction::RaiseTo(to));
+        }
+        assert_eq!(h.n_raises(), 4);
+        assert!(a.abstract_actions(&h).contains(&AbsAction::Bet(0)));
+        assert!(!abs().abstract_actions(&h).contains(&AbsAction::Bet(0)));
+    }
+
+    #[test]
+    fn a_preflop_key_holds_the_effective_stack_against_the_raiser_it_faces() {
+        // Button 0: the first to act is seat 3, then seat 4.
+        let mut h = six_with([10_000, 10_000, 10_000, 2_400, 10_000, 10_000]);
+        assert_eq!(stack_band(&h), 0, "24 bb against deep players");
+        h.apply(PlayerAction::RaiseTo(200));
+        assert_eq!(h.to_act(), 4);
+        assert_eq!(stack_band(&h), 0, "100 bb facing a 24 bb raiser");
+        let mut h = six_with([10_000, 10_000, 10_000, 5_000, 10_000, 10_000]);
+        h.apply(PlayerAction::RaiseTo(200));
+        assert_eq!(stack_band(&h), 1, "facing a 50 bb raiser");
+        let mut h = six_with([10_000, 10_000, 10_000, 30_000, 10_000, 10_000]);
+        h.apply(PlayerAction::RaiseTo(200));
+        assert_eq!(stack_band(&h), 2, "our own 100 bb caps a deeper raiser");
+    }
+
+    #[test]
+    fn a_brasa_pre_key_names_the_menu_its_stacks_leave_and_other_shapes_keep_the_card_bucket() {
+        let a = brasa_pre();
+        let mut rng = SmallRng::seed_from_u64(1);
+        let deep = six_with([10_000; 6]);
+        let hole = deep.hole(3);
+        // 3 bb behind: the pot-sized open is the all-in, so the menu loses it.
+        let short = six_with([10_000, 10_000, 10_000, 300, 10_000, 10_000]);
+        assert!(a.abstract_actions(&short).len() < a.abstract_actions(&deep).len());
+        let (kd, ks) = (a.key_bucket(&deep, hole, &mut rng), a.key_bucket(&short, hole, &mut rng));
+        assert_ne!(kd, ks);
+        assert_eq!(kd % 169, preflop_bucket(hole));
+        assert_eq!(ks % 169, preflop_bucket(hole));
+        // Deeper opponents leave our 100 bb the effective stack and the same menu: the same key.
+        let deeper = six_with([20_000, 15_000, 30_000, 10_000, 12_000, 40_000]);
+        assert_eq!(a.key_bucket(&deeper, hole, &mut rng), kd);
+        assert_eq!(abs().key_bucket(&short, hole, &mut rng), preflop_bucket(hole));
     }
 
     #[test]

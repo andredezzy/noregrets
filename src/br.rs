@@ -424,6 +424,11 @@ pub fn run_br(
     seed: u64,
     search: Option<crate::bot::SearchParams>,
 ) -> BrResult {
+    // WARNING: the probe reads the blueprint by card buckets alone; a BrasaPre key also holds the stack band and the menu offered, so every lookup would miss.
+    assert!(
+        policy.abs.cfg.menu != crate::abstraction::MenuShape::BrasaPre,
+        "BR does not read BrasaPre blueprints: measure them in the server's simulator"
+    );
     let n = cfg.num_players;
     let bb = cfg.bb as f64;
     let lbr = Lbr::new(policy, runouts);

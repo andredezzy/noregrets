@@ -282,6 +282,9 @@ pub struct TrainConfig {
     pub linear_cap: u64,
     /// The house's cut of every contested pot, in basis points (0 = rake free).
     pub rake_bp: u32,
+    /// Deal the traverser `hand.stack` and every other seat a Brasa player's stack
+    /// ([`crate::brasa::stack_at`]) instead of `hand.stack` to everyone: the stacks the bot meets.
+    pub brasa_stacks: bool,
 }
 
 impl Default for TrainConfig {
@@ -297,6 +300,7 @@ impl Default for TrainConfig {
             multiway_focus: 0.0,
             linear_cap: u64::MAX,
             rake_bp: 0,
+            brasa_stacks: false,
         }
     }
 }
@@ -584,7 +588,16 @@ impl Trainer {
                 let traverser = (t % n as u64) as usize;
                 let mut deck = fresh_deck();
                 deck.shuffle(&mut rng);
-                let mut hand = Hand::new(&self.cfg.hand, 0, deck);
+                let mut hand = if self.cfg.brasa_stacks {
+                    let hc = &self.cfg.hand;
+                    let stacks: Vec<u32> = (0..n)
+                        .map(|p| if p == traverser { hc.stack } else { crate::brasa::stack_at(rng.random(), hc.bb) })
+                        .collect();
+                    let cfg = HandConfig { stack: stacks.iter().copied().max().unwrap_or(hc.stack), ..hc.clone() };
+                    Hand::new_with_stacks(&cfg, 0, deck, &stacks)
+                } else {
+                    Hand::new(&self.cfg.hand, 0, deck)
+                };
                 if hand.is_terminal() {
                     continue; // degenerate deal (e.g. blinds all-in, tiny stacks)
                 }
@@ -683,7 +696,7 @@ impl Trainer {
         let acts = self.abs.abstract_actions(h);
         let n = acts.len();
         debug_assert!(n <= MAX_ACTS);
-        let bucket = self.abs.bucket(h.hole(p), h.board(), rng);
+        let bucket = self.abs.key_bucket(h, h.hole(p), rng);
         // Key built on the stack; the map is queried by slice and a heap
         // key is allocated only on the infoset's first visit.
         let mut kbuf = [0u8; KEY_BUF];
@@ -793,7 +806,7 @@ impl Trainer {
             // model; both are fixed, not learned.
             let a = if let Some(opp) = &self.rnr_opp {
                 let p = h.to_act();
-                let bucket = self.abs.bucket(h.hole(p), h.board(), rng);
+                let bucket = self.abs.key_bucket(h, h.hole(p), rng);
                 match opp.get(bucket, hist) {
                     Some(s) if s.len() == acts.len() && s.iter().sum::<f32>() > 0.0 => {
                         let probs: Vec<f64> = s.iter().map(|&x| x as f64).collect();
@@ -1030,7 +1043,7 @@ impl Trainer {
                     if acts.contains(&a) { a } else { acts[0] }
                 }
                 _ => {
-                    let bucket = lc.abs.bucket(h.hole(p), h.board(), rng);
+                    let bucket = lc.abs.key_bucket(&h, h.hole(p), rng);
                     let mut probs: Vec<f64> = match lc.blueprint.get(bucket, &hist) {
                         Some(s) if s.len() == acts.len() => s.iter().map(|&x| x as f64).collect(),
                         _ => vec![1.0 / acts.len() as f64; acts.len()],
@@ -1549,6 +1562,64 @@ mod tests {
             ..TrainConfig::default()
         };
         Trainer::new(Arc::new(abs), cfg)
+    }
+
+    /// Random 3-handed deals on Brasa's stacks and random lines under `menu`: how many infoset keys
+    /// they meet, and how many of those meet more than one menu.
+    fn keys_meeting_several_menus(menu: crate::abstraction::MenuShape) -> (usize, usize) {
+        let abs = Abstraction::new(AbsConfig { postflop_buckets: 6, equity_rollouts: 20, cache_cap: 100_000, menu, ..AbsConfig::default() });
+        let mut menus: std::collections::HashMap<InfoKey, Vec<AbsAction>> = std::collections::HashMap::new();
+        let mut several = std::collections::HashSet::new();
+        let mut rng = SmallRng::seed_from_u64(5);
+        for _ in 0..3_000 {
+            let mut deck = fresh_deck();
+            deck.shuffle(&mut rng);
+            let stacks: Vec<u32> = (0..3).map(|p| if p == 0 { 10_000 } else { crate::brasa::stack_at(rng.random(), 100) }).collect();
+            let hc = HandConfig { num_players: 3, stack: *stacks.iter().max().unwrap(), ..HandConfig::default() };
+            let mut h = Hand::new_with_stacks(&hc, 0, deck, &stacks);
+            let mut hist = Vec::new();
+            while !h.is_terminal() && h.street() == Street::Preflop {
+                let acts = abs.abstract_actions(&h);
+                let key = make_key(abs.key_bucket(&h, h.hole(h.to_act()), &mut rng), &hist);
+                if menus.entry(key.clone()).or_insert_with(|| acts.clone()) != &acts {
+                    several.insert(key);
+                }
+                let a = acts[rng.random_range(0..acts.len())];
+                h.apply(abs.concrete(&h, a));
+                hist.push(a.token());
+            }
+        }
+        (menus.len(), several.len())
+    }
+
+    #[test]
+    fn brasa_pre_keys_meet_one_menu_each_on_brasa_stacks_where_pluribus_keys_meet_several() {
+        let (keys, several) = keys_meeting_several_menus(crate::abstraction::MenuShape::BrasaPre);
+        assert!(keys > 1_000, "{keys} keys met");
+        assert_eq!(several, 0, "{several} of {keys} BrasaPre keys met more than one menu");
+        let (keys, several) = keys_meeting_several_menus(crate::abstraction::MenuShape::Pluribus);
+        assert!(several > 0, "Pluribus keys on Brasa's stacks: {several} of {keys} met more than one menu");
+    }
+
+    #[test]
+    fn brasa_pre_trains_on_brasa_stacks() {
+        let abs = Arc::new(Abstraction::new(AbsConfig {
+            postflop_buckets: 6,
+            equity_rollouts: 20,
+            dist_runouts: 4,
+            runout_rollouts: 10,
+            cache_cap: 100_000,
+            menu: crate::abstraction::MenuShape::BrasaPre,
+        }));
+        let cfg = TrainConfig {
+            hand: HandConfig { num_players: 3, ..HandConfig::default() },
+            brasa_stacks: true,
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let t = Trainer::new(abs, cfg);
+        t.run(2_000, &|_| {});
+        assert!(t.node_count() > 1_000, "{} nodes", t.node_count());
     }
 
     #[test]

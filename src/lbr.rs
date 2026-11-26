@@ -261,6 +261,11 @@ pub struct LbrResult {
 /// Run the LBR probe: LBR and the bot in the two blind seats (alternating by
 /// hand), every other seat folds. Stacks reset per hand, button random.
 pub fn run_lbr(policy: &Policy, cfg: &HandConfig, hands: u64, runouts: u32, seed: u64) -> LbrResult {
+    // WARNING: the probe reads the blueprint by card buckets alone; a BrasaPre key also holds the stack band and the menu offered, so every lookup would miss.
+    assert!(
+        policy.abs.cfg.menu != crate::abstraction::MenuShape::BrasaPre,
+        "LBR does not read BrasaPre blueprints: measure them in the server's simulator"
+    );
     let n = cfg.num_players;
     let bb = cfg.bb as f64;
     let lbr = Lbr::new(policy, runouts);

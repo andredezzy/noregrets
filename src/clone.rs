@@ -111,7 +111,7 @@ fn replay_hand(v: &Value, abs: &Abstraction) -> Result<Vec<Decision>, String> {
                 .iter()
                 .position(|&a| a == abs_a)
                 .ok_or("mapped action not on menu")?;
-            let bucket = abs.bucket([bot[0], bot[1]], table.shadow.board(), &mut rng);
+            let bucket = abs.key_bucket(&table.shadow, [bot[0], bot[1]], &mut rng);
             out.push(Decision {
                 key: make_key(bucket, &table.hist),
                 act_ix,

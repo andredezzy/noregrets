@@ -100,6 +100,10 @@ enum Cmd {
         /// Restricted Nash response: opponent model (random | caller).
         #[arg(long)]
         rnr_model: Option<Baseline>,
+        /// Deal the traverser --stack and every other seat a Brasa player's stack (median 122 bb,
+        /// 4% under 40): the stacks the bot meets, for a blueprint whose keys hold them (--menu brasa-pre).
+        #[arg(long)]
+        brasa_stacks: bool,
         /// Restricted Nash response against a cloned opponent given as a
         /// blueprint file (e.g. slumbot_clone.bin). Overrides --rnr-model;
         /// the trainer adopts the clone's abstraction so keys align.
@@ -528,6 +532,7 @@ fn main() {
             strategic_from,
             train_seed,
             rnr_model,
+            brasa_stacks,
             rnr_opponent,
             rnr_p,
             no_prune,
@@ -567,6 +572,7 @@ fn main() {
                 multiway_focus,
                 linear_cap,
                 rake_bp,
+                brasa_stacks,
                 ..TrainConfig::default()
             };
             let trainer = match &resume {
