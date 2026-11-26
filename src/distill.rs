@@ -287,6 +287,7 @@ mod tests {
                 flop_resolve: false,
                 model_p: None,
                 menu: None,
+                final_iteration: false,
             },
             alpha: 0.5,
             seed: 42,

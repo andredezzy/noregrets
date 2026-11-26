@@ -195,6 +195,17 @@ impl Nodes {
         Some(values.split_off(r.actions()))
     }
 
+    /// A visited node's regrets.
+    fn regret_sums(&self, key: &[u8]) -> Option<Vec<f64>> {
+        let hash = self.hash(key);
+        let s = self.shard(hash).read().unwrap();
+        let r = s.table.find(hash, |r| r.key() == key)?;
+        let mut values = vec![0.0; 2 * r.actions()];
+        r.read(&mut values);
+        values.truncate(r.actions());
+        Some(values)
+    }
+
     /// Every node's key, regrets and strategy sums, until `f` fails.
     fn try_for_each<E>(&self, mut f: impl FnMut(&[u8], &[f64], &[f64]) -> Result<(), E>) -> Result<(), E> {
         let mut values = [0.0f64; 2 * MAX_ACTS];
@@ -1087,6 +1098,18 @@ impl Trainer {
     /// Normalized average strategy for an infoset, if visited.
     pub fn avg_strategy(&self, bucket: u16, hist: &[u8]) -> Option<Vec<f64>> {
         normalize(&self.nodes.strat(&make_key(bucket, hist))?)
+    }
+
+    /// The strategy of the final iteration for an infoset (regret matching on its regrets), if visited and some
+    /// action's regret is positive.
+    pub fn current_strategy(&self, bucket: u16, hist: &[u8]) -> Option<Vec<f64>> {
+        let regrets = self.nodes.regret_sums(&make_key(bucket, hist))?;
+        if !regrets.iter().any(|&r| r > 0.0) {
+            return None;
+        }
+        let mut s = Vec::new();
+        regret_matching(&regrets, &mut s);
+        Some(s)
     }
 
     /// Export the (much smaller) normalized average strategy for play.

@@ -133,6 +133,11 @@ pub struct SearchParams {
     /// 3 pots first-in where the blueprint knows only half a pot, a pot and
     /// all-in. Its depth-limit rollouts map those bets onto the blueprint's.
     pub menu: Option<crate::abstraction::MenuShape>,
+    /// Play the MCCFR resolve's final iteration at the root rather than its average strategy, as Pluribus did:
+    /// "Playing according to the final iteration helps Pluribus avoid poor actions that are not completely eliminated
+    /// in CFR's weighted average strategy" (Brown & Sandholm 2019, supplement). The average stays the fallback when
+    /// no root regret is positive. Off = the average.
+    pub final_iteration: bool,
 }
 
 /// Which part of the search routing produced a distribution.
@@ -159,6 +164,7 @@ impl Default for SearchParams {
             flop_resolve: false,
             model_p: None,
             menu: None,
+            final_iteration: false,
         }
     }
 }
@@ -423,7 +429,17 @@ impl Policy {
         });
         let bucket = sabs.key_bucket(real, real.hole(p), rng);
         let strategy_at = |solver: &crate::cfr::Trainer| {
-            let s = solver.avg_strategy(bucket, hist)?;
+            let avg = solver.avg_strategy(bucket, hist)?;
+            let s = if params.final_iteration {
+                let last = solver.current_strategy(bucket, hist);
+                if std::env::var("NOREGRETS_SEARCH_TRACE").is_ok_and(|v| v == "1") {
+                    let tv = last.as_ref().map_or(f64::NAN, |l| 0.5 * l.iter().zip(&avg).map(|(a, b)| (a - b).abs()).sum::<f64>());
+                    eprintln!("[search] root after {} iterations: average {avg:.3?}, final {last:.3?}, total variation {tv:.3}", solver.iterations());
+                }
+                last.unwrap_or(avg)
+            } else {
+                avg
+            };
             let acts = solver.abs.abstract_actions(real);
             (s.len() == acts.len()).then_some((acts, s))
         };
@@ -881,6 +897,7 @@ mod tests {
                 flop_resolve: false,
                 model_p: None,
                 menu: None,
+                final_iteration: false,
             },
             None,
             None,
@@ -899,6 +916,11 @@ mod tests {
             "must call all-in with the nuts, got {:?}",
             strat
         );
+        // The final iteration, as Pluribus played it, puts nothing on the fold the average still carries from the
+        // first iterations.
+        let last = solver.current_strategy(bucket, &hist).expect("the call's regret is positive");
+        assert_eq!(last.len(), strat.len());
+        assert!((last.iter().sum::<f64>() - 1.0).abs() < 1e-9 && last[0] == 0.0 && last[1] == 1.0, "final iteration {last:?} against average {strat:?}");
         // Sanity: engine agrees calling ends the hand with hero winning.
         let mut done = h.clone();
         done.apply(PlayerAction::CheckCall);
@@ -1078,6 +1100,7 @@ mod tests {
                 flop_resolve: false,
                 model_p: None,
                 menu: None,
+                final_iteration: false,
             },
             &train_cfg,
             Some(&tracker),
@@ -1157,6 +1180,7 @@ mod tests {
                     flop_resolve: false,
                     model_p: None,
                     menu: None,
+                    final_iteration: false,
                 },
                 &train_cfg,
                 Some(&tracker),
@@ -1227,6 +1251,7 @@ mod tests {
             flop_resolve: false,
             model_p: None,
             menu: None,
+            final_iteration: false,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         for _ in 0..4 {
@@ -1362,6 +1387,7 @@ mod tests {
             flop_resolve: false,
             model_p: None,
             menu: None,
+            final_iteration: false,
         };
         let mut table = Table::new(&hand_cfg, 0, deck);
         table.apply_abs(AbsAction::CheckCall, &abs);
@@ -1474,6 +1500,7 @@ mod tests {
             flop_resolve: false,
             model_p: None,
             menu: None,
+            final_iteration: false,
         };
         // EV of calling 800 real: .42(+900) - .58(900) = -144 < fold -100.
         let mut rng = SmallRng::seed_from_u64(9);
@@ -1565,6 +1592,7 @@ mod tests {
                 flop_resolve: false,
                 model_p: None,
                 menu: None,
+                final_iteration: false,
             },
             Some(&tracker),
             Some(LeafCfg {
