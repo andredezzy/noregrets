@@ -47,8 +47,9 @@ pub struct Model {
     pub bb_raise: f64,
     /// Postflop, unbet: the read thresholds of the bet sizes (s, m, l); heads-up then multiway, by street.
     pub unbet: [[[f64; 3]; 3]; 2],
-    /// Postflop, facing a bet, by its size against the pot before it ([`size_bucket`]: up to 0.4,
-    /// 0.8, 1.5, 3 and 6 pots, and above): the read thresholds (raise, continue); heads-up then multiway, by street.
+    /// Postflop, facing a bet, by the call it takes (no more than the player's stack) against the pot before the bet
+    /// ([`size_bucket`]: up to 0.4, 0.8, 1.5, 3 and 6 pots, and above): the read thresholds (raise, continue); heads-up
+    /// then multiway, by street.
     pub facing: [[[(f64, f64); 6]; 3]; 2],
     /// The same, facing a bet the bot made (the seat the model plays against): Brasa's players continue more against
     /// the bot's bets of up to 3 pots than against each other's; above that the thresholds are `facing`'s.
@@ -399,8 +400,12 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
         };
         return Intent::RaiseTo((BET_POTS[z] * pot).round() as u32);
     }
+    // WARNING: a short stack facing a shove risks only what it holds: account2's 140 bb shove into 15.7 with king high
+    // was a 2.9-pot call to the 50 bb stack that called it with bottom pair (2026-11-26 00:41Z), and every called
+    // K3-kind shove live had come from such a stack. Sized by the whole bet, the model folded them as if facing 9 pots.
     let bet = f64::from(h.to_call());
-    let size = size_bucket(bet / (pot - bet).max(1.0));
+    let call = bet.min(f64::from(h.stack(p)));
+    let size = size_bucket(call / (pot - bet).max(1.0));
     let facing = if h.aggressor() == Some(bot) { &m.facing_bot } else { &m.facing };
     let (raise, cont) = facing[table][st][size];
     let guess = rng.random::<f64>() < m.facing_guess[size];
@@ -513,6 +518,11 @@ mod tests {
 
     /// [`facing_flop_bet`] with the button holding `hole`.
     fn facing_flop_bet_with(hole: &str, bet: u32) -> Hand {
+        facing_flop_bet_behind(hole, bet, 100_000)
+    }
+
+    /// [`facing_flop_bet_with`] with the button starting the hand on `stack`.
+    fn facing_flop_bet_behind(hole: &str, bet: u32, stack: u32) -> Hand {
         let cards = parse_cards(&format!("{hole} Ad Qd Kc 9c 2d")).expect("cards parse");
         let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
         for (i, &c) in cards.iter().enumerate() {
@@ -520,12 +530,25 @@ mod tests {
         }
         let deck: [u8; 52] = deck.try_into().expect("52 cards");
         let cfg = HandConfig { num_players: 2, stack: 100_000, ..HandConfig::default() };
-        let mut h = Hand::new(&cfg, 0, deck);
+        let mut h = Hand::new_with_stacks(&cfg, 0, deck, &[stack, 100_000]);
         h.apply(PlayerAction::CheckCall);
         h.apply(PlayerAction::CheckCall);
         assert_eq!((h.street(), h.to_act(), h.pot()), (Street::Flop, 1, 200));
         h.apply(PlayerAction::RaiseTo(bet));
         h
+    }
+
+    #[test]
+    fn account2_a_short_stack_faces_a_shove_as_the_call_it_can_make() {
+        // 2026-11-26 00:41Z: 140 bb into 15.7 with king high, called for the 50 bb behind with bottom pair.
+        let m = Model::default();
+        let short = facing_flop_bet_behind("3h 2c", 20_000, 600);
+        assert_eq!(short.stack(0), 500);
+        let shove_deep = continue_share(&m, &facing_flop_bet_with("3h 2c", 20_000), 4000);
+        let shove_short = continue_share(&m, &short, 4000);
+        let its_call = continue_share(&m, &facing_flop_bet_with("3h 2c", 500), 4000);
+        assert!((shove_short - its_call).abs() < 0.03, "short stack {shove_short} against a 2.5-pot bet {its_call}");
+        assert!(shove_short > shove_deep + 0.05, "short stack {shove_short} against a deep stack {shove_deep}");
     }
 
     fn fold_share(h: &Hand, n: usize) -> f64 {
