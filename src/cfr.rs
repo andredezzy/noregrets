@@ -638,14 +638,21 @@ impl Trainer {
         sampler: Option<&RootSampler<'_>>,
     ) {
         let start = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(time_ms);
         let n = root.num_players();
         let hero = self.spine.as_ref().map_or(root.to_act(), |s| s.hero);
-        while self.iterations() < max_iters
-            && (start.elapsed().as_millis() as u64) < time_ms
-        {
+        while self.iterations() < max_iters && start.elapsed() < budget {
             let t0 = self.iters_done.load(Ordering::Relaxed);
             let batch = 1024.min(max_iters - t0);
+            let ran = AtomicU64::new(0);
             (0..batch).into_par_iter().for_each(|j| {
+                // WARNING: the clock was read only between batches, and one batch of a four-way flop, reading cold pages of
+                // the mapped blueprint, ran a 5 s search to 7.25 s, past the bot's deadline (account1, 2026-11-27 16:12Z).
+                // Each traversal reads it now, so a search ends within one traversal of its budget.
+                if start.elapsed() >= budget {
+                    return;
+                }
+                ran.fetch_add(1, Ordering::Relaxed);
                 let t = t0 + j + 1;
                 let mut rng =
                     SmallRng::seed_from_u64(t.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xACE);
@@ -663,7 +670,7 @@ impl Trainer {
                 let mut hist = root_hist.to_vec();
                 self.traverse(&h, &mut hist, traverser, t as f64, 1.0, false, model_opp, &mut rng);
             });
-            self.iters_done.fetch_add(batch, Ordering::Relaxed);
+            self.iters_done.fetch_add(ran.into_inner(), Ordering::Relaxed);
         }
     }
 
