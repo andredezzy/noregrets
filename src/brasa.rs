@@ -17,23 +17,26 @@ use std::sync::OnceLock;
 
 /// The rates and read noises a Brasa player acts by. Preflop, they are moment-matched in the simulator: a simulated
 /// table's raise, call and fold shares by position and raise faced sit within a point of those of Brasa's players.
-/// Postflop, they are fitted on Brasa's live hands read through the model (4,714 hands of account1, account2 and
-/// account3 with an opponent past the flop, 2026-11-16 to 26): each opponent's possible holes are weighted by the
+/// Postflop, they are fitted on Brasa's live hands read through the model (5,395 hands of account1, account2 and
+/// account3 with an opponent past the flop, of 6,089, 2026-11-16 to 26): each opponent's possible holes are weighted by the
 /// model's chance of the actions it took. Every context's thresholds (street, heads-up or multiway, unbet or the size
 /// faced) are set so the model's chance of each action, given what each player did before in the hand, averages the
 /// live share there; a context with under 30 live decisions takes its size's shares. The read's noise, power, share
-/// of random reads and what a hand is ranked against are those under which the 5,350 holes the players showed are
+/// of random reads and what a hand is ranked against are those under which the 6,011 holes the players showed are
 /// likeliest. Brasa's players read their hands far more loosely than a pure strength order: they check and call with
 /// strong hands and bet with nothing; facing a bet up to 3 pots, a tenth to a fifth of them continue whatever they
 /// hold, and above 0.8 pots the rest judge their hand against hands that make a pair. Facing 3 pots or more, the read
 /// is the one under which the callers' shown hands come closest to the live ones: sharp (noise 0.05), with a
 /// twentieth calling 3 to 6 pots whatever they hold and a fiftieth calling more: the smallest share that takes most of
 /// the likelihood random callers add (62% of it) while moving their callers' strength by a point. No one raises on a
-/// guess. Their callers there hold two pairs or better in 32% of the model's hands against 37% of 141 shown, and their
-/// raisers 83% against 93% of 15. Facing the bot's own bets of up to 3 pots they continue more than facing each
-/// other's: those spots have thresholds of their own (`facing_bot`), fitted on the 3,101 decisions facing them, each pulled toward the share facing anyone else with the weight of 3 decisions.
-/// Bigger bets of the bot are faced as anyone else's: 84 decisions cannot tell both how often and with what players
-/// call them. Raise thresholds below zero let a strong hand
+/// guess. Their callers there hold two pairs or better in 32% of the model's hands against 35% of 162 shown, and their
+/// raisers 85% against 93% of 15. The callers of 6 pots or more hold them in 31% against 40% of 48 shown, but no
+/// sharper read closes that without the shown holes growing less likely (4 to 11 nats for reads against top pair or
+/// two pairs past 3 or 6 pots): those callers hold both strong hands and weak ones. Facing the bot's own bets they
+/// continue otherwise than facing each other's, so every size faced has thresholds of its own (`facing_bot`), fitted
+/// on the 3,555 decisions facing them, each pulled toward the share facing anyone else with the weight of 3 decisions:
+/// against the bot's bets of 3 to 6 pots they continue 19% (31% when those were faced as anyone else's), against 6
+/// pots or more 23%. Raise thresholds below zero let a strong hand
 /// raise only when its read strays low. The trainer (`train --rnr-model brasa`) and the server's simulator play the
 /// same model through [`intent`]; `BRASA_MODEL`, a JSON file of this shape, replaces the defaults in both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,31 +98,31 @@ impl Default for Model {
             ],
             bb_raise: 0.145,
             unbet: [
-                [[0.104, 0.116, 0.173], [0.182, 0.15, 0.069], [0.158, 0.13, 0.155]],
-                [[0.106, 0.082, 0.067], [0.126, 0.077, 0.057], [0.129, 0.081, 0.108]],
+                [[0.104, 0.116, 0.173], [0.184, 0.152, 0.07], [0.157, 0.129, 0.154]],
+                [[0.109, 0.084, 0.068], [0.127, 0.078, 0.057], [0.13, 0.082, 0.109]],
             ],
             facing: [
                 [
-                    [(0.174, 0.799), (0.153, 0.626), (0.256, 0.765), (0.189, 0.703), (-0.017, 0.675), (0.187, 0.488)],
-                    [(0.161, 0.85), (0.042, 0.608), (0.121, 0.731), (0.052, 0.724), (0.215, 0.803), (0.139, 0.498)],
-                    [(0.17, 0.737), (0.041, 0.606), (0.098, 0.667), (-0.129, 0.493), (0.212, 0.657), (0.151, 0.472)],
+                    [(0.17, 0.799), (0.139, 0.623), (0.228, 0.735), (0.184, 0.707), (-0.017, 0.677), (0.187, 0.481)],
+                    [(0.157, 0.85), (0.052, 0.616), (0.096, 0.731), (0.034, 0.686), (0.194, 0.782), (0.102, 0.463)],
+                    [(0.159, 0.738), (0.034, 0.606), (0.117, 0.678), (-0.152, 0.511), (0.189, 0.601), (0.133, 0.418)],
                 ],
                 [
-                    [(0.147, 0.69), (0.053, 0.545), (0.159, 0.73), (0.035, 0.619), (0.225, 0.65), (-0.022, 0.602)],
-                    [(0.083, 0.727), (0.039, 0.514), (0.096, 0.645), (0.098, 0.624), (0.301, 0.715), (0.199, 0.668)],
-                    [(0.12, 0.597), (0.044, 0.417), (0.142, 0.518), (0.133, 0.54), (0.001, 0.436), (0.273, 0.581)],
+                    [(0.147, 0.691), (0.055, 0.549), (0.165, 0.726), (0.024, 0.607), (0.198, 0.664), (-0.022, 0.602)],
+                    [(0.084, 0.729), (0.039, 0.522), (0.11, 0.652), (0.115, 0.613), (0.287, 0.692), (0.224, 0.812)],
+                    [(0.124, 0.609), (0.051, 0.43), (0.148, 0.515), (0.133, 0.542), (-0.006, 0.484), (0.2, 0.502)],
                 ],
             ],
             facing_bot: [
                 [
-                    [(-0.006, 0.974), (0.135, 0.621), (0.106, 0.742), (0.215, 0.747), (-0.017, 0.675), (0.187, 0.488)],
-                    [(-0.194, 0.914), (0.135, 0.731), (0.223, 0.729), (-0.251, 0.762), (0.215, 0.803), (0.139, 0.498)],
-                    [(-0.216, 0.79), (0.11, 0.672), (0.205, 0.701), (-0.348, 0.396), (0.212, 0.657), (0.151, 0.472)],
+                    [(-0.009, 0.973), (0.14, 0.642), (0.145, 0.747), (0.2, 0.731), (0.294, 0.693), (0.187, 0.514)],
+                    [(-0.199, 0.919), (0.167, 0.725), (0.215, 0.734), (-0.28, 0.726), (0.016, 0.548), (0.032, 0.639)],
+                    [(-0.232, 0.809), (0.102, 0.687), (0.201, 0.703), (-0.366, 0.407), (0.171, 0.891), (0.133, 0.418)],
                 ],
                 [
-                    [(0.059, 0.593), (0.061, 0.547), (0.121, 0.719), (0.224, 0.701), (0.225, 0.65), (-0.022, 0.602)],
-                    [(0.034, 0.67), (0.082, 0.544), (0.058, 0.676), (0.018, 0.725), (0.301, 0.715), (0.199, 0.668)],
-                    [(0.095, 0.527), (0.03, 0.399), (-0.248, 0.515), (-0.069, 0.264), (0.001, 0.436), (0.273, 0.581)],
+                    [(0.052, 0.6), (0.061, 0.546), (0.127, 0.721), (0.219, 0.703), (0.206, 0.518), (-0.022, 0.628)],
+                    [(0.027, 0.694), (0.072, 0.536), (0.072, 0.683), (0.008, 0.717), (0.113, 0.355), (0.1, 0.809)],
+                    [(0.075, 0.559), (0.024, 0.393), (0.048, 0.548), (-0.098, 0.428), (-0.055, 0.202), (0.2, 0.502)],
                 ],
             ],
             preflop_noise: 0.08,
