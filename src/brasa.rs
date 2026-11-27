@@ -54,6 +54,12 @@ pub struct Model {
     /// The same, facing a bet the bot made (the seat the model plays against): Brasa's players continue more against
     /// the bot's bets of up to 3 pots than against each other's; above that the thresholds are `facing`'s.
     pub facing_bot: [[[(f64, f64); 6]; 3]; 2],
+    /// The same, facing a raise after putting chips in on the street (a bet, a raise or a call before), whoever
+    /// raised; None faces it as any bet. Live a flop bettor re-raised by up to 0.4 pots folded 4% of 312 times, by
+    /// 0.4 to 0.8 pots 14% of 128 and by 0.8 to 1.5 pots 18% of 77, where `facing`'s thresholds for those sizes
+    /// made it 17%, 31% and 36%: the search saw folds no one makes.
+    #[serde(default)]
+    pub facing_reraised: Option<[[[(f64, f64); 6]; 3]; 2]>,
     /// How far a read strays (0 strongest, 1 weakest), as the sd of a normal noise: preflop; postflop unbet; postflop
     /// facing each of the six sizes.
     pub preflop_noise: f64,
@@ -122,6 +128,7 @@ impl Default for Model {
                     [(0.095, 0.527), (0.03, 0.399), (-0.248, 0.515), (-0.069, 0.264), (0.001, 0.436), (0.273, 0.581)],
                 ],
             ],
+            facing_reraised: None,
             preflop_noise: 0.08,
             unbet_noise: 0.3,
             facing_noise: [0.2, 0.2, 0.2, 0.2, 0.05, 0.05],
@@ -478,7 +485,11 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
     let bet = f64::from(h.to_call());
     let call = bet.min(f64::from(h.stack(p)));
     let size = size_bucket(call / (pot - bet).max(1.0));
-    let facing = if h.aggressor() == Some(bot) { &m.facing_bot } else { &m.facing };
+    let facing = match &m.facing_reraised {
+        Some(reraised) if h.street_commit(p) > 0 => reraised,
+        _ if h.aggressor() == Some(bot) => &m.facing_bot,
+        _ => &m.facing,
+    };
     let (raise, cont) = facing[table][st][size];
     let guess = rng.random::<f64>() < m.facing_guess[size];
     let r = if guess {
@@ -746,6 +757,30 @@ mod tests {
             (0..200).filter(|_| intent_by(&m, &shove, bot, &mut rng) != Intent::Fold).count()
         };
         assert_eq!((goes_on(bettor), goes_on(NO_BOT)), (200, 0));
+    }
+
+    #[test]
+    fn a_player_re_raised_after_betting_faces_the_raise_by_its_own_thresholds() {
+        // Re-raised after its own bet, everyone continues; facing a first bet, no one does.
+        let m = Model {
+            facing: [[[(-1.0, -1.0); 6]; 3]; 2],
+            facing_bot: [[[(-1.0, -1.0); 6]; 3]; 2],
+            facing_reraised: Some([[[(-1.0, 2.0); 6]; 3]; 2]),
+            facing_guess: [0.0; 6],
+            ..Model::default()
+        };
+        let first = facing_flop_bet_with("7s 3h", 100);
+        let mut reraised = first.clone();
+        reraised.apply(PlayerAction::RaiseTo(300));
+        assert!(reraised.street_commit(reraised.to_act()) > 0);
+        let goes_on = |m: &Model, h: &Hand| {
+            let mut rng = SmallRng::seed_from_u64(31);
+            (0..200).filter(|_| intent_by(m, h, NO_BOT, &mut rng) != Intent::Fold).count()
+        };
+        assert_eq!((goes_on(&m, &reraised), goes_on(&m, &first)), (200, 0));
+        // without thresholds of its own, the raise is faced as any bet
+        let without = Model { facing_reraised: None, ..m };
+        assert_eq!(goes_on(&without, &reraised), 0);
     }
 
     #[test]
