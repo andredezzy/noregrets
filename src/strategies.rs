@@ -2,8 +2,10 @@
 //! them, held by history: the infosets of one betting history sit together, their buckets
 //! ascending beside their probabilities, so a history's bytes are kept once instead of once per
 //! bucket. r3's 273M infosets average 18.6 key bytes and 2.4 actions: one record per key took ~45
-//! bytes an infoset (12.3 GB); by history they take ~13. The probabilities are the f32s stored,
-//! bit for bit.
+//! bytes an infoset (12.3 GB). They fall in 57.8M histories, 4.7 infosets each: by history r3 holds
+//! 5.9 GB resident after its load (peak 6.6 GB), ~22 bytes an infoset, of which 40 are each
+//! history's [`Head`]. The probabilities are the f32s stored, bit for bit: bpcheck read all 273M
+//! back from r3's file (2026-11-27).
 //!
 //! A map read from a file or collected is held by history at once. Inserts into it go to a table
 //! of their own, which lookups read first, until [`StrategyMap::freeze`] folds them in.
