@@ -17,6 +17,7 @@ pub mod net;
 pub mod play;
 pub mod portfolio;
 mod record;
+mod strategies;
 pub mod river;
 pub mod search;
 pub mod slumbot;

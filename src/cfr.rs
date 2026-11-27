@@ -1097,6 +1097,7 @@ impl Trainer {
                 strategies.insert(key, &s.iter().map(|&x| x as f32).collect::<Vec<f32>>());
             }
         });
+        strategies.freeze();
         Blueprint {
             strategies,
             iterations: self.iterations(),
@@ -1355,129 +1356,7 @@ pub fn sample_index(probs: &[f64], rng: &mut SmallRng) -> usize {
     probs.len() - 1
 }
 
-/// Strategy store keyed by (bucket, history) bytes: each infoset one [`Record`] of f32
-/// probabilities behind a thin pointer. As a map of `Vec<u8>` to `Vec<f32>` the 172M-infoset
-/// blueprint took 18 GB in the live server. It serializes as that map did (len + entries), so
-/// existing .bin files load as they are. ahash: `get` runs on every decision of every hand.
-pub struct StrategyMap {
-    table: HashTable<Record<4>>,
-    arena: Arena,
-    hasher: ahash::RandomState,
-}
-
-impl StrategyMap {
-    pub fn with_capacity(n: usize) -> Self {
-        StrategyMap { table: HashTable::with_capacity(n), arena: Arena::new(), hasher: ahash::RandomState::new() }
-    }
-
-    pub fn len(&self) -> usize {
-        self.table.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<&[f32]> {
-        let hash = self.hasher.hash_one(key);
-        self.table.find(hash, |r| r.key() == key).map(|r| r.floats())
-    }
-
-    /// `key`'s probabilities, in place of any it had.
-    pub fn insert(&mut self, key: &[u8], probs: &[f32]) {
-        let StrategyMap { table, arena, hasher } = self;
-        let hash = hasher.hash_one(key);
-        let mut fresh = Record::new_in(arena, key, probs.len());
-        fresh.floats_mut().copy_from_slice(probs);
-        match table.find_mut(hash, |r| r.key() == key) {
-            Some(r) => *r = fresh,
-            None => {
-                table.insert_unique(hash, fresh, |r| hasher.hash_one(r.key()));
-            }
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[f32])> {
-        self.table.iter().map(|r| (r.key(), r.floats()))
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.table.iter().map(|r| r.key())
-    }
-
-    pub fn values(&self) -> impl Iterator<Item = &[f32]> {
-        self.table.iter().map(|r| r.floats())
-    }
-}
-
-impl Default for StrategyMap {
-    fn default() -> Self {
-        StrategyMap::with_capacity(0)
-    }
-}
-
-impl Clone for StrategyMap {
-    fn clone(&self) -> Self {
-        let mut copy = StrategyMap::with_capacity(self.len());
-        for (key, probs) in self.iter() {
-            copy.insert(key, probs);
-        }
-        copy
-    }
-}
-
-impl PartialEq for StrategyMap {
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().all(|(key, probs)| other.get(key) == Some(probs))
-    }
-}
-
-impl std::fmt::Debug for StrategyMap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StrategyMap({} infosets)", self.len())
-    }
-}
-
-impl FromIterator<(Vec<u8>, Vec<f32>)> for StrategyMap {
-    fn from_iter<I: IntoIterator<Item = (Vec<u8>, Vec<f32>)>>(entries: I) -> Self {
-        let mut map = StrategyMap::default();
-        for (key, probs) in entries {
-            map.insert(&key, &probs);
-        }
-        map
-    }
-}
-
-impl Serialize for StrategyMap {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = s.serialize_map(Some(self.len()))?;
-        for (key, probs) in self.iter() {
-            map.serialize_entry(key, probs)?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for StrategyMap {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Entries;
-        impl<'de> serde::de::Visitor<'de> for Entries {
-            type Value = StrategyMap;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a map of infoset keys to probabilities")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut entries: A) -> Result<StrategyMap, A::Error> {
-                let mut map = StrategyMap::with_capacity(entries.size_hint().unwrap_or(0));
-                while let Some((key, probs)) = entries.next_entry::<Vec<u8>, Vec<f32>>()? {
-                    map.insert(&key, &probs);
-                }
-                Ok(map)
-            }
-        }
-        d.deserialize_map(Entries)
-    }
-}
+pub use crate::strategies::StrategyMap;
 
 /// The trained average strategy used at the table, together with the card
 /// abstraction it was trained under (config + k-means centroids), so play
