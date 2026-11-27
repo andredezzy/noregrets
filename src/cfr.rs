@@ -1182,6 +1182,23 @@ struct LegacyAbsConfig {
     cache_cap: usize,
 }
 
+/// A mapped blueprint file's tail: everything but the strategies.
+#[derive(Deserialize)]
+struct BlueprintMeta {
+    iterations: u64,
+    num_players: usize,
+    abs_cfg: AbsConfig,
+    centroids: Option<Centroids>,
+}
+
+#[derive(Serialize)]
+struct BlueprintMetaRef<'a> {
+    iterations: u64,
+    num_players: usize,
+    abs_cfg: &'a AbsConfig,
+    centroids: &'a Option<Centroids>,
+}
+
 #[derive(Deserialize)]
 struct LegacyBlueprint {
     strategies: StrategyMap,
@@ -1380,7 +1397,29 @@ impl Blueprint {
         bincode::serialize_into(f, self).map_err(std::io::Error::other)
     }
 
+    /// Writes the blueprint as a file [`Blueprint::load`] maps in place: every process that loads
+    /// it shares one copy of its strategies in memory, and a load takes no time. Every insert into
+    /// its strategies must be frozen in.
+    pub fn save_mapped(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let tail = bincode::serialize(&BlueprintMetaRef {
+            iterations: self.iterations,
+            num_players: self.num_players,
+            abs_cfg: &self.abs_cfg,
+            centroids: &self.centroids,
+        })
+        .map_err(std::io::Error::other)?;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        self.strategies.write_mapped(&mut f, &tail)?;
+        f.flush()
+    }
+
     pub fn load(path: &str) -> std::io::Result<Blueprint> {
+        if StrategyMap::is_mapped_file(path)? {
+            let (strategies, tail) = StrategyMap::map(path)?;
+            let meta: BlueprintMeta = bincode::deserialize(&tail).map_err(std::io::Error::other)?;
+            return Ok(Blueprint { strategies, iterations: meta.iterations, num_players: meta.num_players, abs_cfg: meta.abs_cfg, centroids: meta.centroids });
+        }
         let f = std::io::BufReader::new(std::fs::File::open(path)?);
         match bincode::deserialize_from(f) {
             Ok(bp) => Ok(bp),
@@ -1917,6 +1956,13 @@ mod tests {
         assert_eq!(blueprint_from_checkpoint(ckpt_s, 2, false, bp_s).unwrap(), bp.strategies.len());
         let bp3 = Blueprint::load(bp_s).unwrap();
         assert_eq!((&bp3.strategies, bp3.iterations, bp3.num_players), (&bp.strategies, iters_before, 2));
+        // the same blueprint as a mapped file loads to the same strategies, settings and centroids
+        let mapped_s = format!("{bp_s}.mapped");
+        bp3.save_mapped(&mapped_s).unwrap();
+        let bp4 = Blueprint::load(&mapped_s).unwrap();
+        assert_eq!((&bp4.strategies, bp4.iterations, bp4.num_players), (&bp3.strategies, bp3.iterations, 2));
+        assert_eq!((bp4.abs_cfg.postflop_buckets, &bp4.centroids), (bp3.abs_cfg.postflop_buckets, &bp3.centroids));
+        std::fs::remove_file(&mapped_s).unwrap();
         assert_eq!(bp2.num_players, 2);
         assert_eq!(bp2.abs_cfg.postflop_buckets, 6);
         assert_eq!(bp2.centroids, t.abs.centroids);

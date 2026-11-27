@@ -494,6 +494,14 @@ enum Cmd {
         #[arg(long)]
         fill_current: bool,
     },
+    /// Writes a blueprint as a file the server maps in place: one copy of its strategies in memory
+    /// for every process that loads it, and no load time.
+    Compact {
+        #[arg(long)]
+        blueprint: String,
+        #[arg(long)]
+        out: String,
+    },
     /// Print blueprint statistics.
     Inspect {
         #[arg(long, default_value = "blueprint.bin")]
@@ -1320,6 +1328,12 @@ fn main() {
             let strategies = pluribus::cfr::blueprint_from_checkpoint(&checkpoint, players, fill_current, &out)
                 .unwrap_or_else(|e| die(&format!("cannot export {checkpoint}: {e}")));
             println!("blueprint saved to {out} ({strategies} strategies)");
+        }
+
+        Cmd::Compact { blueprint, out } => {
+            let bp = Blueprint::load(&blueprint).unwrap_or_else(|e| die(&format!("cannot load {blueprint}: {e}")));
+            bp.save_mapped(&out).unwrap_or_else(|e| die(&format!("cannot write {out}: {e}")));
+            println!("{out}: {} infosets, mapped in place", bp.strategies.len());
         }
 
         Cmd::Inspect { blueprint } => {
