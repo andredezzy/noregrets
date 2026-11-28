@@ -279,6 +279,7 @@ mod tests {
             hands: 40,
             params: SearchParams {
                 time_ms: 300,
+                max_ms: None,
                 max_iters: 500,
                 qre_lambda: None,
                 safe_resolve: false,

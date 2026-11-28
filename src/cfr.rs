@@ -22,6 +22,7 @@ use hashbrown::HashTable;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 pub type InfoKey = Box<[u8]>;
 
@@ -328,6 +329,135 @@ const BIAS_MULT: f64 = 5.0;
 /// Re-randomizes hidden cards at a subgame root before each traversal.
 pub type RootSampler<'a> = dyn Fn(&mut Hand, &mut SmallRng) + Sync + 'a;
 
+/// The wall time the subgame searches of one process share: over every interval in which `n` of
+/// them run, each accrues `1/n` of it. A search's share is the time it would have had the machine
+/// to itself, so its budget buys the same traversals however many searches run beside it.
+pub struct ShareClock(std::sync::Mutex<ShareState>);
+
+/// The process's subgame searches, on one clock.
+pub static SEARCHES: ShareClock = ShareClock::new();
+
+/// A [`ShareClock`]'s count of the searches running and the share each has accrued since it began.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShareState {
+    running: u32,
+    /// The sum, over the clock's life, of each interval divided by the searches running in it.
+    accrued: Duration,
+    /// When `accrued` was last brought up to date; none before the first search.
+    since: Option<Instant>,
+}
+
+impl ShareState {
+    /// `accrued` as of `now`, with the searches running unchanged since `since`.
+    fn at(&self, now: Instant) -> Duration {
+        match self.since {
+            Some(since) if self.running > 0 => self.accrued + now.saturating_duration_since(since) / self.running,
+            _ => self.accrued,
+        }
+    }
+
+    /// Brings `accrued` up to `now` and counts `delta` searches more (or fewer) from then on.
+    fn count(&mut self, now: Instant, delta: i32) {
+        self.accrued = self.at(now);
+        self.since = Some(self.since.map_or(now, |since| since.max(now)));
+        self.running = self.running.saturating_add_signed(delta);
+    }
+}
+
+impl ShareClock {
+    pub const fn new() -> Self {
+        ShareClock(std::sync::Mutex::new(ShareState { running: 0, accrued: Duration::ZERO, since: None }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ShareState> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Counts a search from now until the returned guard drops.
+    pub fn enter(&self) -> SharedSearch<'_> {
+        let mut state = self.state();
+        let start = Instant::now();
+        state.count(start, 1);
+        SharedSearch { clock: self, start, mark: state.accrued }
+    }
+}
+
+impl Default for ShareClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One search counted on a [`ShareClock`], from [`ShareClock::enter`] until it drops.
+pub struct SharedSearch<'c> {
+    clock: &'c ShareClock,
+    start: Instant,
+    /// The clock's accrued share when the search began.
+    mark: Duration,
+}
+
+impl SharedSearch<'_> {
+    /// The search's wall time and its share of it, and the searches running (this one among them), read at
+    /// one instant.
+    pub fn elapsed(&self) -> (Spent, u32) {
+        let state = self.clock.state();
+        let now = Instant::now();
+        let spent = Spent { wall: now.saturating_duration_since(self.start), share: state.at(now).saturating_sub(self.mark) };
+        (spent, state.running)
+    }
+}
+
+impl Drop for SharedSearch<'_> {
+    fn drop(&mut self) {
+        let mut state = self.clock.state();
+        state.count(Instant::now(), -1);
+    }
+}
+
+/// What a search has spent: its wall time and its share of it (never more than the wall time).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spent {
+    pub wall: Duration,
+    pub share: Duration,
+}
+
+/// What a subgame search may spend. It stops at whichever of the three it reaches first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Its share of the wall time on the [`ShareClock`]: alone, the wall time itself.
+    pub share: Duration,
+    /// The wall time it never passes, however many searches share the machine.
+    pub wall: Duration,
+    /// The most traversals.
+    pub iters: u64,
+}
+
+impl Budget {
+    /// A share of `share_ms` within `wall_ms` of wall time. With no `wall_ms` the wall is capped at `share_ms`:
+    /// a share never outruns the wall time it accrues in, so every search then stops at `share_ms` of wall
+    /// time, alone or beside others, as before the share clock.
+    pub fn new(share_ms: u64, wall_ms: Option<u64>, iters: u64) -> Self {
+        Budget {
+            share: Duration::from_millis(share_ms),
+            wall: Duration::from_millis(wall_ms.unwrap_or(share_ms)),
+            iters,
+        }
+    }
+
+    pub fn spent(&self, spent: Spent) -> bool {
+        spent.wall >= self.wall || spent.share >= self.share
+    }
+
+    /// The wall time at which a search that has spent `spent`, with `running` searches on its clock, reaches
+    /// its share if they stay running, or its cap first. A traversal reads its clock against this, with no lock;
+    /// a search that starts or ends beside it moves it only at the next batch. With no cap of its own it is the
+    /// share itself: a share never outruns the wall time it accrues in.
+    pub fn stop_after(&self, spent: Spent, running: u32) -> Duration {
+        let to_share = self.share.saturating_sub(spent.share).checked_mul(running.max(1)).unwrap_or(Duration::MAX);
+        self.wall.min(spent.wall.saturating_add(to_share))
+    }
+}
+
 /// Round-start rooting for online search (Pluribus): the subgame is rooted
 /// at the start of the current betting round and the actions actually
 /// taken since form the "spine". The hero's spine actions are held fixed
@@ -624,7 +754,8 @@ impl Trainer {
         progress(iterations);
     }
 
-    /// Train a subgame rooted at `root` for a time/iteration budget.
+    /// Train a subgame rooted at `root` until `budget` is spent, counted on
+    /// `clock` from start to end beside the other searches it runs with.
     /// Hidden cards are resampled every traversal — uniformly by default, or
     /// by `sampler` (range-weighted sampling from a RangeTracker) — so the
     /// solver learns strategies for every bucket; callers query the bucket
@@ -633,23 +764,27 @@ impl Trainer {
         &self,
         root: &Hand,
         root_hist: &[u8],
-        time_ms: u64,
-        max_iters: u64,
+        budget: Budget,
+        clock: &ShareClock,
         sampler: Option<&RootSampler<'_>>,
     ) {
-        let start = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(time_ms);
+        let search = clock.enter();
         let n = root.num_players();
         let hero = self.spine.as_ref().map_or(root.to_act(), |s| s.hero);
-        while self.iterations() < max_iters && start.elapsed() < budget {
+        while self.iterations() < budget.iters {
+            let (spent, running) = search.elapsed();
+            if budget.spent(spent) {
+                break;
+            }
+            let stop = search.start + budget.stop_after(spent, running);
             let t0 = self.iters_done.load(Ordering::Relaxed);
-            let batch = 1024.min(max_iters - t0);
+            let batch = 1024.min(budget.iters - t0);
             let ran = AtomicU64::new(0);
             (0..batch).into_par_iter().for_each(|j| {
                 // WARNING: the clock was read only between batches, and one batch of a four-way flop, reading cold pages of
                 // the mapped blueprint, ran a 5 s search to 7.25 s, past the bot's deadline (account1, 2026-11-27 16:12Z).
-                // Each traversal reads it now, so a search ends within one traversal of its budget.
-                if start.elapsed() >= budget {
+                // Each traversal reads it now, so a search ends within one traversal of its wall cap.
+                if Instant::now() >= stop {
                     return;
                 }
                 ran.fetch_add(1, Ordering::Relaxed);
@@ -1924,11 +2059,183 @@ mod tests {
     fn subgame_solver_keeps_regrets_nonnegative() {
         let t = push_fold_trainer().with_plus(true);
         let h = Hand::new(&t.cfg.hand, 0, fresh_deck());
-        t.run_subgame(&h, &[], 5_000, 2_000, None);
+        t.run_subgame(&h, &[], Budget::new(5_000, None, 2_000), &SEARCHES, None);
         assert!(t.node_count() > 0);
         t.nodes.for_each(|_, regret, _| {
             assert!(regret.iter().all(|&r| r >= 0.0), "CFR+ regrets must be nonnegative, got {regret:?}");
         });
+    }
+
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_search_alone_accrues_its_wall_time_and_each_of_three_together_a_third_of_it() {
+        let t0 = Instant::now();
+        let mut clock = ShareState::default();
+        clock.count(t0, 1);
+        let a = clock.accrued;
+        assert_eq!(clock.at(t0 + ms(900)) - a, ms(900));
+        clock.count(t0 + ms(1_000), 1);
+        clock.count(t0 + ms(1_000), 1);
+        assert_eq!(clock.at(t0 + ms(4_000)) - a, ms(2_000), "1 s alone, then 3 s of three");
+    }
+
+    #[test]
+    fn a_search_accrues_each_interval_divided_by_the_searches_running_in_it() {
+        let t0 = Instant::now();
+        let mut clock = ShareState::default();
+        clock.count(t0, 1);
+        let a = clock.accrued;
+        clock.count(t0 + ms(1_000), 1);
+        let b = clock.accrued;
+        clock.count(t0 + ms(2_000), 1);
+        let c = clock.accrued;
+        clock.count(t0 + ms(4_000), -1);
+        assert_eq!(clock.accrued - b, ms(500) + ms(2_000) / 3, "B, from 1 s to its end at 4 s");
+        let at = clock.at(t0 + ms(5_000));
+        assert_eq!(at - a, ms(1_000) + ms(500) + ms(2_000) / 3 + ms(500));
+        assert_eq!(at - c, ms(2_000) / 3 + ms(500));
+        clock.count(t0 + ms(5_000), -1);
+        clock.count(t0 + ms(5_000), -1);
+        assert_eq!((clock.running, clock.at(t0 + ms(9_000))), (0, at), "nothing accrues with no search running");
+    }
+
+    /// The unchanged default: a share never outruns the wall time it accrued in, so a budget whose
+    /// wall cap is its share stops a search at that wall time exactly, whatever ran beside it.
+    #[test]
+    fn with_no_wall_cap_a_search_stops_at_its_share_of_wall_time_whatever_runs_beside_it() {
+        let budget = Budget::new(5_000, None, 1_000);
+        assert_eq!((budget.share, budget.wall), (ms(5_000), ms(5_000)));
+        let mut rng = SmallRng::seed_from_u64(11);
+        for _ in 0..200 {
+            let t0 = Instant::now();
+            let mut clock = ShareState::default();
+            clock.count(t0, 1);
+            let mark = clock.accrued;
+            let mut now = t0;
+            for _ in 0..40 {
+                now += Duration::from_micros(rng.random_range(0..400_000));
+                let delta = if clock.running > 1 && rng.random::<bool>() { -1 } else { 1 };
+                clock.count(now, delta);
+                let spent = Spent { wall: now - t0, share: clock.at(now) - mark };
+                assert!(spent.share <= spent.wall, "{spent:?}");
+                assert_eq!(budget.spent(spent), spent.wall >= ms(5_000), "{spent:?}");
+                assert_eq!(budget.stop_after(spent, clock.running), ms(5_000), "{spent:?} beside {}", clock.running);
+            }
+        }
+    }
+
+    #[test]
+    fn a_traversal_stops_where_the_share_would_reach_its_budget_with_the_searches_running_as_they_are_or_at_the_cap() {
+        let budget = Budget::new(5_000, Some(10_000), u64::MAX);
+        let spent = Spent { wall: ms(2_000), share: ms(1_000) };
+        assert_eq!(budget.stop_after(spent, 1), ms(6_000));
+        assert_eq!(budget.stop_after(spent, 2), ms(10_000));
+        assert_eq!(budget.stop_after(spent, 3), ms(10_000), "the cap");
+        assert_eq!(Budget::new(5_000, Some(20_000), u64::MAX).stop_after(spent, 3), ms(14_000));
+    }
+
+    /// `k` searches of `budget` started together on a simulated machine that runs `rate` traversals a ms,
+    /// split evenly among the searches running, as a CPU-bound resolve shares the server's threads: each
+    /// one's traversals and wall time.
+    fn on_a_shared_machine(k: usize, budget: Budget, rate: f64) -> Vec<(f64, Duration)> {
+        let t0 = Instant::now();
+        let mut clock = ShareState::default();
+        let marks: Vec<Duration> = (0..k)
+            .map(|_| {
+                clock.count(t0, 1);
+                clock.accrued
+            })
+            .collect();
+        let mut runs: Vec<(f64, Option<Duration>)> = vec![(0.0, None); k];
+        let mut now = t0;
+        while runs.iter().any(|r| r.1.is_none()) {
+            let running = runs.iter().filter(|r| r.1.is_none()).count();
+            now += ms(1);
+            for (run, &mark) in runs.iter_mut().zip(&marks).filter(|(r, _)| r.1.is_none()) {
+                run.0 += rate / running as f64;
+                let spent = Spent { wall: now - t0, share: clock.at(now) - mark };
+                if budget.spent(spent) {
+                    clock.count(now, -1);
+                    run.1 = Some(spent.wall);
+                }
+            }
+        }
+        runs.into_iter().map(|(n, wall)| (n, wall.expect("every search ends"))).collect()
+    }
+
+    #[test]
+    fn on_a_shared_machine_searches_together_each_run_the_traversals_of_one_alone_over_longer_wall_time_until_the_cap() {
+        let close = |n: f64, want: f64| (n - want).abs() <= 0.002 * want;
+        let fair = Budget::new(5_000, Some(16_000), u64::MAX);
+        for k in 1..=3 {
+            for (n, wall) in on_a_shared_machine(k, fair, 100.0) {
+                assert!(close(n, 500_000.0) && wall == ms(5_000 * k as u64), "{k} together: {n} in {wall:?}");
+            }
+        }
+        for (n, wall) in on_a_shared_machine(3, Budget::new(5_000, Some(10_000), u64::MAX), 100.0) {
+            assert!(close(n, 1_000_000.0 / 3.0) && wall == ms(10_000), "3 together, capped at 10 s: {n} in {wall:?}");
+        }
+        for (n, wall) in on_a_shared_machine(3, Budget::new(5_000, None, u64::MAX), 100.0) {
+            assert!(close(n, 500_000.0 / 3.0) && wall == ms(5_000), "3 together, no cap: {n} in {wall:?}");
+        }
+    }
+
+    /// `k` searches of `budget` on a clock and a thread pool of their own, started together from `k` threads
+    /// as the server's requests start them: each one's wall time. On the global pool a batch would wait behind
+    /// other tests' work.
+    fn searches_together(k: usize, budget: Budget) -> Vec<Duration> {
+        let abs = Arc::new(Abstraction::new(AbsConfig {
+            postflop_buckets: 2,
+            equity_rollouts: 1,
+            dist_runouts: 1,
+            runout_rollouts: 1,
+            cache_cap: 1_000_000,
+            menu: crate::abstraction::MenuShape::Wide,
+        }));
+        let cfg = TrainConfig {
+            hand: HandConfig { num_players: 2, stack: 1_000, sb: 50, bb: 100 },
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let clock = ShareClock::new();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(k + 2).build().expect("a thread pool");
+        let root = Hand::new(&cfg.hand, 0, fresh_deck());
+        let ready = std::sync::Barrier::new(k);
+        std::thread::scope(|s| {
+            let runs: Vec<_> = (0..k)
+                .map(|_| {
+                    s.spawn(|| {
+                        let t = Trainer::new(abs.clone(), cfg.clone()).with_plus(true);
+                        ready.wait();
+                        let start = Instant::now();
+                        pool.install(|| t.run_subgame(&root, &[], budget, &clock, None));
+                        start.elapsed()
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().expect("a search")).collect()
+        })
+    }
+
+    /// The share clock in the search itself: the wall time grows with the searches running beside it, up to
+    /// the cap, and with no cap every search stops at its budget in wall time. Traversals are left to the
+    /// simulated machine above: on a test runner's few or busy cores they measure the scheduler.
+    #[test]
+    fn a_search_beside_others_runs_longer_in_wall_time_up_to_its_cap_and_with_no_cap_stops_at_its_budget() {
+        let share = 300;
+        let slack = ms(1_000);
+        let fair = Budget::new(share, Some(10_000), u64::MAX);
+        for k in 1..=3u64 {
+            let walls = searches_together(k as usize, fair);
+            assert!(walls.iter().all(|&w| w >= ms(share * k * 8 / 10) && w < ms(share * k) + slack), "{k} together: {walls:?}");
+        }
+        let capped = searches_together(3, Budget::new(share, Some(450), u64::MAX));
+        assert!(capped.iter().all(|&w| w >= ms(450) && w < ms(450) + slack), "3 together, capped at 450 ms: {capped:?}");
+        let uncapped = searches_together(3, Budget::new(share, None, u64::MAX));
+        assert!(uncapped.iter().all(|&w| w >= ms(share) && w < ms(share) + slack), "3 together, no cap: {uncapped:?}");
     }
 
     #[test]

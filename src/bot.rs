@@ -10,7 +10,7 @@
 //! with MCCFR.
 
 use crate::abstraction::{AbsAction, AbsConfig, Abstraction};
-use crate::cfr::{sample_index, Blueprint, LeafCfg, Spine, TrainConfig, Trainer};
+use crate::cfr::{sample_index, Blueprint, Budget, LeafCfg, Spine, TrainConfig, Trainer, SEARCHES};
 use crate::engine::{Hand, Street};
 use crate::search::RangeTracker;
 use crate::table::RoundRoot;
@@ -101,7 +101,15 @@ pub struct Policy {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchParams {
+    /// The MCCFR resolve's share of the wall time (`cfr::ShareClock`): alone,
+    /// its wall time; beside other searches, the time it would have had the
+    /// machine for. The exact solvers (river, turn, flop net) take it as wall
+    /// time.
     pub time_ms: u64,
+    /// The wall time an MCCFR resolve never passes, however many searches
+    /// run beside it. None caps it at `time_ms`: every resolve then stops at
+    /// `time_ms` of wall time, as before the share clock.
+    pub max_ms: Option<u64>,
     pub max_iters: u64,
     /// Model opponents as lambda-rational (logit QRE) instead of fully
     /// rational. None = solve toward equilibrium (default).
@@ -173,6 +181,7 @@ impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
             time_ms: 2_000,
+            max_ms: None,
             max_iters: 2_000_000,
             qre_lambda: None,
             safe_resolve: false,
@@ -736,6 +745,7 @@ pub fn resolve_subgame(
         root: Some((root.clone(), root_hist.len())),
         ..l
     });
+    let budget = Budget::new(params.time_ms, params.max_ms, params.max_iters);
     let t = Trainer::new(abs, train_cfg.clone())
         .with_leaf(leaf)
         .with_plus(true)
@@ -748,9 +758,9 @@ pub fn resolve_subgame(
                 let holes = tr.sample_holes(h, rng);
                 h.resample_hidden_with(&holes, rng);
             };
-            t.run_subgame(root, root_hist, params.time_ms, params.max_iters, Some(&sampler));
+            t.run_subgame(root, root_hist, budget, &SEARCHES, Some(&sampler));
         }
-        None => t.run_subgame(root, root_hist, params.time_ms, params.max_iters, None),
+        None => t.run_subgame(root, root_hist, budget, &SEARCHES, None),
     }
     t
 }
@@ -927,6 +937,7 @@ mod tests {
             &hist,
             SearchParams {
                 time_ms: 60_000, // generous: survives CPU contention in CI
+                max_ms: None,
                 max_iters: 20_000,
                 qre_lambda: None,
                 safe_resolve: false,
@@ -1261,6 +1272,7 @@ mod tests {
             &hist,
             SearchParams {
                 time_ms: 5_000,
+                max_ms: None,
                 max_iters: 300,
                 qre_lambda: None,
                 safe_resolve: true,
@@ -1340,6 +1352,7 @@ mod tests {
                 &table.hist,
                 SearchParams {
                     time_ms: 30_000,
+                    max_ms: None,
                     max_iters: 20_000,
                     qre_lambda: None,
                     safe_resolve: safe,
@@ -1410,6 +1423,7 @@ mod tests {
         };
         let params = SearchParams {
             time_ms: 30_000,
+            max_ms: None,
             max_iters: 20_000,
             qre_lambda: None,
             safe_resolve: true,
@@ -1545,6 +1559,7 @@ mod tests {
         };
         let params = SearchParams {
             time_ms: 100,
+            max_ms: None,
             max_iters: 5_000,
             qre_lambda: None,
             safe_resolve: true,
@@ -1657,6 +1672,7 @@ mod tests {
         };
         let params = SearchParams {
             time_ms: 10_000,
+            max_ms: None,
             max_iters: 20_000,
             qre_lambda: None,
             safe_resolve: false,
@@ -1748,6 +1764,7 @@ mod tests {
             &hist,
             SearchParams {
                 time_ms: 5_000,
+                max_ms: None,
                 max_iters: 3_000,
                 qre_lambda: None,
                 safe_resolve: false,
