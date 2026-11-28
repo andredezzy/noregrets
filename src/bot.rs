@@ -147,6 +147,28 @@ pub enum SearchSource {
     Resolve,
 }
 
+/// What a resolve did for one decision, measured rather than budgeted: under a
+/// shared CPU the same time budget buys fewer traversals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchWork {
+    /// Traversals the resolve whose strategy answered ran.
+    pub iterations: u64,
+    /// Wall time spent resolving the decision, in ms: a round-rooted resolve
+    /// that missed the hero's infoset counts too.
+    pub ms: u64,
+}
+
+/// A search's action distribution, the routing that produced it, and, for an
+/// MCCFR resolve, its work; `work` is None for the blueprint and for the
+/// exact solvers (river, turn, flop net).
+#[derive(Clone, Debug)]
+pub struct SearchDist {
+    pub acts: Vec<AbsAction>,
+    pub probs: Vec<f64>,
+    pub source: SearchSource,
+    pub work: Option<SearchWork>,
+}
+
 impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
@@ -345,13 +367,35 @@ impl Policy {
         params: SearchParams,
         train_cfg: &TrainConfig,
         tracker: Option<&RangeTracker>,
-        mut session: Option<&mut SearchSession>,
+        session: Option<&mut SearchSession>,
         round: Option<&RoundRoot>,
         rng: &mut SmallRng,
     ) -> (Vec<AbsAction>, Vec<f64>, SearchSource) {
+        let d = self.search_dist_measured(
+            real, shadow, hist, params, train_cfg, tracker, session, round, rng,
+        );
+        (d.acts, d.probs, d.source)
+    }
+
+    /// `search_dist_sourced`, with the resolve's measured work: how many
+    /// traversals the resolve that answered ran and how long resolving took.
+    /// The distribution is the same; only the measurement is added.
+    pub fn search_dist_measured(
+        &self,
+        real: &Hand,
+        shadow: &Hand,
+        hist: &[u8],
+        params: SearchParams,
+        train_cfg: &TrainConfig,
+        tracker: Option<&RangeTracker>,
+        mut session: Option<&mut SearchSession>,
+        round: Option<&RoundRoot>,
+        rng: &mut SmallRng,
+    ) -> SearchDist {
+        let solved = |acts, probs, source| SearchDist { acts, probs, source, work: None };
         let blueprint = |rng: &mut SmallRng| {
             let (a, p) = self.blueprint_dist(shadow, hist, rng);
-            (a, p, SearchSource::Blueprint)
+            solved(a, p, SearchSource::Blueprint)
         };
         if real.street() == Street::Preflop {
             return blueprint(rng);
@@ -363,7 +407,7 @@ impl Policy {
             if let Some(tr) = tracker {
                 let sess = session.as_deref();
                 if let Some((a, p)) = self.river_dist(real, hist, tr, params, sess, rng) {
-                    return (a, p, SearchSource::River);
+                    return solved(a, p, SearchSource::River);
                 }
             }
         }
@@ -375,7 +419,7 @@ impl Policy {
             if let Some(tr) = tracker {
                 let sess = session.as_deref_mut();
                 if let Some((a, p)) = self.turn_dist(real, hist, tr, params, sess, rng) {
-                    return (a, p, SearchSource::Turn);
+                    return solved(a, p, SearchSource::Turn);
                 }
             }
         }
@@ -385,7 +429,7 @@ impl Policy {
             // The net's leaf values are equilibrium values: no use against the model.
             if let (Some(tr), Some(net), false) = (tracker, &self.value_net, model) {
                 if let Some((a, p)) = self.flop_net_dist(real, tr, net, params, rng) {
-                    return (a, p, SearchSource::FlopNet);
+                    return solved(a, p, SearchSource::FlopNet);
                 }
             }
             // Without a net, a table-budget MCCFR resolve is worse than the
@@ -427,6 +471,16 @@ impl Policy {
             let acts = solver.abs.abstract_actions(real);
             (s.len() == acts.len()).then_some((acts, s))
         };
+        let started = std::time::Instant::now();
+        let resolved = |acts, probs, solver: &crate::cfr::Trainer| SearchDist {
+            acts,
+            probs,
+            source: SearchSource::Resolve,
+            work: Some(SearchWork {
+                iterations: solver.iterations(),
+                ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }),
+        };
         if let Some(r) = round {
             let spine = Spine {
                 hero: p,
@@ -446,7 +500,7 @@ impl Policy {
                 Some(spine),
             );
             if let Some((acts, s)) = strategy_at(&solver) {
-                return (acts, s, SearchSource::Resolve);
+                return resolved(acts, s, &solver);
             }
         }
         // A round-rooted resolve samples the whole round and can miss the
@@ -454,7 +508,7 @@ impl Policy {
         // decision itself, every hero iteration passes through it.
         let solver = resolve_subgame(sabs, train_cfg, real, hist, params, tracker, leaf(), None);
         if let Some((acts, s)) = strategy_at(&solver) {
-            return (acts, s, SearchSource::Resolve);
+            return resolved(acts, s, &solver);
         }
         blueprint(rng)
     }
@@ -999,6 +1053,143 @@ mod tests {
         );
         assert_eq!(acts, vec![AbsAction::Fold, AbsAction::CheckCall]);
         assert!(probs[1] > 0.9, "must call with the nuts three-way, got {probs:?}");
+    }
+
+    /// A deck that deals `front` first, then every other card in order.
+    fn deck_with(front: &str) -> [u8; 52] {
+        let front = parse_cards(front).unwrap();
+        let mut deck = fresh_deck();
+        let mut used = [false; 52];
+        for (i, &c) in front.iter().enumerate() {
+            deck[i] = c;
+            used[c as usize] = true;
+        }
+        let mut idx = front.len();
+        for c in 0..52u8 {
+            if !used[c as usize] {
+                deck[idx] = c;
+                idx += 1;
+            }
+        }
+        deck
+    }
+
+    fn empty_policy(abs: &Arc<Abstraction>, num_players: usize) -> Policy {
+        Policy::new(
+            Blueprint {
+                strategies: Default::default(),
+                iterations: 0,
+                num_players,
+                abs_cfg: AbsConfig::default(),
+                centroids: None,
+            },
+            abs.clone(),
+        )
+    }
+
+    /// A three-way river facing a shove and a call is the MCCFR resolve's:
+    /// it reports the traversals it ran (all `max_iters` of them, well inside
+    /// the time budget) and the time it took, not the budget.
+    #[test]
+    fn a_resolve_reports_the_traversals_it_ran_and_how_long_it_took() {
+        use crate::table::Table;
+        let hand_cfg = HandConfig {
+            num_players: 3,
+            stack: 2_000,
+            sb: 50,
+            bb: 100,
+        };
+        let abs = Arc::new(abs_small());
+        let policy = empty_policy(&abs, 3);
+        let mut table = Table::new(&hand_cfg, 0, deck_with("As Ks 2c 7d 8h 9c Qs Js Ts 3h 4d"));
+        let mut tracker = RangeTracker::new(3);
+        for _ in 0..3 {
+            table.apply_abs(AbsAction::CheckCall, &abs);
+        }
+        tracker.exclude(table.real.board());
+        for _ in 0..2 {
+            for _ in 0..3 {
+                table.apply_abs(AbsAction::CheckCall, &abs);
+            }
+            tracker.exclude(table.real.board());
+        }
+        table.apply_abs(AbsAction::AllIn, &abs);
+        table.apply_abs(AbsAction::CheckCall, &abs);
+        assert_eq!((table.real.street(), table.real.live_count()), (Street::River, 3));
+        let train_cfg = TrainConfig {
+            hand: hand_cfg,
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let params = SearchParams {
+            time_ms: 60_000,
+            max_iters: 2_000,
+            ..SearchParams::default()
+        };
+        let mut rng = SmallRng::seed_from_u64(3);
+        let d = policy.search_dist_measured(
+            &table.real,
+            &table.shadow,
+            &table.hist,
+            params,
+            &train_cfg,
+            Some(&tracker),
+            None,
+            Some(&table.round),
+            &mut rng,
+        );
+        assert_eq!(d.source, SearchSource::Resolve);
+        let work = d.work.expect("a resolve reports its work");
+        assert_eq!(work.iterations, 2_000, "{work:?}");
+        assert!(work.ms < 60_000, "the time taken, not the budget: {work:?}");
+    }
+
+    /// The blueprint (preflop) and the exact river solver (heads-up river
+    /// shove) run no MCCFR resolve: they report no resolve work.
+    #[test]
+    fn the_blueprint_and_the_exact_river_solver_report_no_resolve_work() {
+        let hand_cfg = HandConfig {
+            num_players: 2,
+            stack: 2_000,
+            sb: 50,
+            bb: 100,
+        };
+        let abs = Arc::new(abs_small());
+        let policy = empty_policy(&abs, 2);
+        let train_cfg = TrainConfig {
+            hand: hand_cfg.clone(),
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let params = SearchParams {
+            time_ms: 5_000,
+            max_iters: 300,
+            ..SearchParams::default()
+        };
+        let mut rng = SmallRng::seed_from_u64(5);
+        let mut h = Hand::new(&hand_cfg, 0, deck_with("As Ks 2c 7d Qs Js Ts 3h 4d"));
+        let preflop = policy.search_dist_measured(&h, &h, &[], params, &train_cfg, None, None, None, &mut rng);
+        assert_eq!((preflop.source, preflop.work), (SearchSource::Blueprint, None));
+
+        let mut hist: Vec<u8> = Vec::new();
+        let act = |h: &mut Hand, hist: &mut Vec<u8>, a: AbsAction| {
+            let street_before = h.street();
+            h.apply(abs.concrete(h, a));
+            hist.push(a.token());
+            if !h.is_terminal() && h.street() != street_before {
+                hist.push(crate::abstraction::TOKEN_STREET_SEP);
+            }
+        };
+        for _ in 0..3 {
+            act(&mut h, &mut hist, AbsAction::CheckCall);
+            act(&mut h, &mut hist, AbsAction::CheckCall);
+        }
+        act(&mut h, &mut hist, AbsAction::AllIn);
+        assert_eq!((h.street(), h.to_act()), (Street::River, 0));
+        let mut tracker = RangeTracker::new(2);
+        tracker.exclude(h.board());
+        let river = policy.search_dist_measured(&h, &h, &hist, params, &train_cfg, Some(&tracker), None, None, &mut rng);
+        assert_eq!((river.source, river.work), (SearchSource::River, None));
     }
 
     /// Safe (gadget) river resolving end to end through act_with_search:
