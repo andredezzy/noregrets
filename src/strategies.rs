@@ -581,6 +581,34 @@ impl StrategyMap {
 
     /// The map in the file at `path`, read in place, and the tail written after it. A file that is
     /// not one [`StrategyMap::write_mapped`] wrote, or is cut short, is an error.
+    /// Writes to `out` the mapped strategies file `src` with the probabilities of `patches`' keys replaced, for each key
+    /// the file holds with as many actions; the layout stays the file's, so every other byte is copied as it is (on
+    /// APFS a clone: no second copy on disk) and `src` is only read. Returns how many keys were replaced and skipped.
+    pub fn write_patched(src: &str, out: &str, patches: &[(Vec<u8>, Vec<f32>)]) -> std::io::Result<(usize, usize)> {
+        use std::io::{Seek, SeekFrom, Write};
+        let (map, _) = StrategyMap::map(src)?;
+        let base = map.groups.map.as_ref().ok_or_else(|| std::io::Error::other(format!("{src}: not mapped")))?.as_ptr() as usize;
+        let mut writes = Vec::new();
+        let mut skipped = 0;
+        for (key, probs) in patches {
+            match map.get(key) {
+                Some(old) if old.len() == probs.len() => writes.push(((old.as_ptr() as usize - base) as u64, probs)),
+                _ => skipped += 1,
+            }
+        }
+        drop(map);
+        std::fs::copy(src, out)?;
+        let mut f = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).open(out)?);
+        for (at, probs) in &writes {
+            f.seek(SeekFrom::Start(*at))?;
+            for p in probs.iter() {
+                f.write_all(&p.to_le_bytes())?;
+            }
+        }
+        f.into_inner().map_err(std::io::Error::other)?.sync_all()?;
+        Ok((writes.len(), skipped))
+    }
+
     pub fn map(path: &str) -> std::io::Result<(StrategyMap, Vec<u8>)> {
         let bad = |what: &str| std::io::Error::other(format!("{path}: not a mapped strategies file ({what})"));
         let file = std::fs::File::open(path)?;
@@ -777,6 +805,35 @@ mod tests {
         assert!(grown.groups.map.is_none());
         assert_eq!(grown.len(), all.len() + 1);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_patched_file_holds_the_new_probabilities_and_every_other_infoset_as_before() {
+        let all = entries();
+        let map: StrategyMap = all.clone().into_iter().collect();
+        let dir = std::env::temp_dir();
+        let src = dir.join(format!("strategies-src-{}.map", std::process::id()));
+        let out = dir.join(format!("strategies-out-{}.map", std::process::id()));
+        let (src, out) = (src.to_str().unwrap(), out.to_str().unwrap());
+        let mut f = std::io::BufWriter::new(std::fs::File::create(src).unwrap());
+        map.write_mapped(&mut f, b"tail").unwrap();
+        drop(f);
+        let (key, probs) = all[0].clone();
+        let new: Vec<f32> = probs.iter().rev().copied().collect();
+        let patches = vec![(key.clone(), new.clone()), (make_key(9, &[1, 2, 3]).to_vec(), vec![1.0]), (key.clone(), vec![1.0; probs.len() + 1])];
+        let (replaced, skipped) = StrategyMap::write_patched(src, out, &patches).unwrap();
+        // the first replaced, the unknown key and the one with another action count skipped
+        assert_eq!((replaced, skipped), (1, 2));
+        let (patched, tail) = StrategyMap::map(out).unwrap();
+        assert_eq!(tail, b"tail");
+        assert_eq!(patched.get(&key), Some(&new[..]));
+        for (k, p) in &all[1..] {
+            assert_eq!(patched.get(k), Some(&p[..]));
+        }
+        // the source is untouched
+        assert_eq!(StrategyMap::map(src).unwrap().0.get(&key), Some(&probs[..]));
+        std::fs::remove_file(src).unwrap();
+        std::fs::remove_file(out).unwrap();
     }
 
     #[test]

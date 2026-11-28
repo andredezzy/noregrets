@@ -14,6 +14,7 @@ pub mod eval;
 pub mod flop;
 pub mod lbr;
 pub mod net;
+pub mod patch;
 pub mod play;
 pub mod portfolio;
 mod record;

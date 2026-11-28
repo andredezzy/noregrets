@@ -502,6 +502,40 @@ enum Cmd {
         #[arg(long)]
         out: String,
     },
+    /// Trains rare preflop histories from their own roots (`pluribus::patch`): each history replayed on the
+    /// blueprint's tree, every player's hole dealt from its reach under the blueprint, restricted Nash response against
+    /// the Brasa model, no pruning, the hand past preflop frozen to the blueprint. One JSON line per root: its history,
+    /// the trained infosets at and below it, the time, and with `--ev-samples` the hero's EV per hand under the model
+    /// with the blueprint's strategy and with the trained one.
+    PreflopTrain {
+        #[arg(long)]
+        blueprint: String,
+        /// A JSON array of `pluribus::patch::PreflopRoot`, on the blueprint's seats.
+        #[arg(long)]
+        roots: String,
+        #[arg(long)]
+        iters: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 0.5)]
+        rnr_p: f64,
+        #[arg(long, default_value_t = 500)]
+        rake_bp: u32,
+        #[arg(long, default_value_t = 0)]
+        ev_samples: usize,
+        #[arg(long)]
+        out: String,
+    },
+    /// Writes a mapped blueprint with the infosets of `preflop-train`'s JSON lines replaced, as a new file; the
+    /// blueprint itself is only read.
+    PatchMap {
+        #[arg(long)]
+        blueprint: String,
+        #[arg(long)]
+        patch: Vec<String>,
+        #[arg(long)]
+        out: String,
+    },
     /// Print blueprint statistics.
     Inspect {
         #[arg(long, default_value = "blueprint.bin")]
@@ -1334,6 +1368,59 @@ fn main() {
             let bp = Blueprint::load(&blueprint).unwrap_or_else(|e| die(&format!("cannot load {blueprint}: {e}")));
             bp.save_mapped(&out).unwrap_or_else(|e| die(&format!("cannot write {out}: {e}")));
             println!("{out}: {} infosets, mapped in place", bp.strategies.len());
+        }
+
+        Cmd::PreflopTrain { blueprint, roots, iters, seed, rnr_p, rake_bp, ev_samples, out } => {
+            use std::io::Write;
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let bp = Arc::new(Blueprint::load(&blueprint).unwrap_or_else(|e| die(&format!("cannot load {blueprint}: {e}"))));
+            let abs = Arc::new(Abstraction::with_centroids(bp.abs_cfg.clone(), bp.centroids.clone()));
+            let text = std::fs::read_to_string(&roots).unwrap_or_else(|e| die(&format!("cannot read {roots}: {e}")));
+            let roots: Vec<pluribus::patch::PreflopRoot> = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("roots: {e}")));
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&out).unwrap_or_else(|e| die(&format!("cannot write {out}: {e}"))));
+            for root in &roots {
+                let r = match pluribus::patch::train_root(&bp, &abs, root, iters, seed, rnr_p, rake_bp) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        continue;
+                    }
+                };
+                let trained: std::collections::HashMap<Vec<u8>, Vec<f32>> = r.strategies.iter().cloned().collect();
+                let mut line = serde_json::json!({
+                    "name": root.name, "hist": hex(&r.hist), "iterations": r.iterations, "seconds": r.seconds,
+                    "strategies": r.strategies.iter().map(|(k, p)| (hex(k), serde_json::json!(p))).collect::<serde_json::Map<_, _>>(),
+                });
+                if ev_samples > 0 {
+                    let t0 = std::time::Instant::now();
+                    let before = pluribus::patch::model_ev(&bp, &abs, root, rake_bp, ev_samples, seed, &|b, h| bp.get(b, h).map(<[f32]>::to_vec)).unwrap_or_default();
+                    let after = pluribus::patch::model_ev(&bp, &abs, root, rake_bp, ev_samples, seed, &|b, h| trained.get(&pluribus::cfr::make_key(b, h).to_vec()).cloned()).unwrap_or_default();
+                    let as_json = |v: &[(u16, f64, f64)]| v.iter().map(|&(b, m, s)| (b.to_string(), serde_json::json!([m, s]))).collect::<serde_json::Map<_, _>>();
+                    line["ev_before"] = serde_json::Value::Object(as_json(&before));
+                    line["ev_after"] = serde_json::Value::Object(as_json(&after));
+                    line["ev_seconds"] = serde_json::json!(t0.elapsed().as_secs_f64());
+                }
+                writeln!(w, "{line}").unwrap_or_else(|e| die(&format!("cannot write {out}: {e}")));
+                w.flush().ok();
+                eprintln!("{}: {} iterations in {:.0} s, {} infosets", root.name, r.iterations, r.seconds, r.strategies.len());
+            }
+        }
+
+        Cmd::PatchMap { blueprint, patch, out } => {
+            let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex key")).collect::<Vec<u8>>();
+            let mut patches = Vec::new();
+            for file in &patch {
+                let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("cannot read {file}: {e}")));
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+                    for (k, p) in v["strategies"].as_object().into_iter().flatten() {
+                        let probs: Vec<f32> = serde_json::from_value(p.clone()).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+                        patches.push((unhex(k), probs));
+                    }
+                }
+            }
+            let (replaced, skipped) = pluribus::cfr::StrategyMap::write_patched(&blueprint, &out, &patches).unwrap_or_else(|e| die(&format!("cannot patch {blueprint} into {out}: {e}")));
+            println!("{out}: {replaced} infosets replaced, {skipped} not in {blueprint} (or with another action count) left out");
         }
 
         Cmd::Inspect { blueprint } => {

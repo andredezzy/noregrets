@@ -320,6 +320,9 @@ pub struct LeafCfg {
     /// them): a solver whose menu differs from the blueprint's replays its
     /// line from there to look the blueprint up (`Trainer::blueprint_hist`).
     pub root: Option<(Hand, usize)>,
+    /// Past the limit every player follows the blueprint as it is, with no continuation strategy to choose (against
+    /// the model, the opponents play it): the rest of the hand frozen, for training the nodes above it alone.
+    pub frozen: bool,
 }
 
 const LEAF_BIASES: usize = 4; // 0 = blueprint, 1 = fold-, 2 = call-, 3 = raise-biased
@@ -654,8 +657,9 @@ impl Trainer {
                 }
                 ran.fetch_add(1, Ordering::Relaxed);
                 let t = t0 + j + 1;
+                // the training seed (0 for the search) sets apart independent runs of one subgame
                 let mut rng =
-                    SmallRng::seed_from_u64(t.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xACE);
+                    SmallRng::seed_from_u64(t.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xACE ^ self.cfg.seed);
                 // RNR subgame: against the model only the hero learns, so the hero traverses.
                 let model_opp = self.rnr.as_ref().is_some_and(|r| rng.random::<f64>() < r.p);
                 let traverser = if model_opp { hero } else { (t % n as u64) as usize };
@@ -943,6 +947,14 @@ impl Trainer {
     ) -> f64 {
         // Against the model, the opponents play it out in the rollout: no continuation to choose.
         let model = if model_opp { self.rnr.as_ref().map(|r| r.model) } else { None };
+        if lc.frozen {
+            // a folded traverser has lost what it put in, however the others play on
+            if h.folded(traverser) {
+                return -f64::from(h.hand_commit(traverser));
+            }
+            let bp_hist = self.blueprint_hist(lc, hist);
+            return self.leaf_rollout(h, &bp_hist, &[0; MAX_PLAYERS], traverser, lc, model, rng);
+        }
         let mut biases = [0usize; MAX_PLAYERS];
         for (p, bias) in biases.iter_mut().enumerate().take(h.num_players()) {
             if p == traverser || h.folded(p) || h.all_in(p) || model.is_some() {
@@ -1786,6 +1798,7 @@ mod tests {
             abs: bp_abs.clone(),
             limit: Street::Flop,
             root: Some((root.clone(), root_hist.len())),
+            frozen: false,
         };
         let solver = Trainer::new(search_abs.clone(), TrainConfig::default());
         let line = |acts: &[AbsAction]| -> Vec<u8> {

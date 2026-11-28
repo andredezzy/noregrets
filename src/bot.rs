@@ -446,6 +446,7 @@ impl Policy {
                 abs: self.abs.clone(),
                 limit: Street::Flop,
                 root: None,
+                frozen: false,
             })
         };
         let sabs = self.search_abs.clone().unwrap_or_else(|| self.abs.clone());
@@ -1763,6 +1764,7 @@ mod tests {
                 abs: abs.clone(),
                 limit: Street::Flop,
                 root: None,
+                frozen: false,
             }),
         None,
         );
