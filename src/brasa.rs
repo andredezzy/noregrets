@@ -507,6 +507,318 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
     }
 }
 
+/// What a Brasa player at `h` decides by, without its cards: the spot [`intent_by`] reads, for [`chances`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spot {
+    pub street: Street,
+    /// Nothing to call: the big blind's option preflop, an unbet street postflop.
+    pub can_check: bool,
+    /// Preflop: the raises so far and the bet faced, in big blinds (the engine's chips over the big blind).
+    pub raises: u8,
+    pub bet_bb: u32,
+    /// Preflop facing a raise with its or the raiser's chips under [`SHORT_STACK_BB`]: it may shove any two cards.
+    pub short: bool,
+    /// Postflop: more than two players still in the hand.
+    pub multiway: bool,
+    /// Postflop facing a bet: the size faced ([`size_bucket`] of the call capped at the player's chips), whether the
+    /// bet is the bot's, and whether the player put chips in on the street before.
+    pub size: usize,
+    pub vs_bot: bool,
+    pub committed: bool,
+}
+
+impl Spot {
+    /// The spot of the player to act at `h`, against the bot's seat `bot`, as [`intent_by`] reads it.
+    pub fn of(h: &Hand, bot: usize) -> Spot {
+        let p = h.to_act();
+        let bb = h.big_blind();
+        let raises = h.n_raises();
+        let chips = |s: usize| h.stack(s) + h.hand_commit(s);
+        let short = h.street() == Street::Preflop
+            && h.aggressor().filter(|_| raises > 0).is_some_and(|a| chips(p).min(chips(a)) < SHORT_STACK_BB * bb);
+        let bet = f64::from(h.to_call());
+        let call = bet.min(f64::from(h.stack(p)));
+        Spot {
+            street: h.street(),
+            can_check: h.can_check(),
+            raises,
+            bet_bb: h.current_bet() / bb,
+            short,
+            multiway: h.live_count() > 2,
+            size: size_bucket(call / (f64::from(h.pot()) - bet).max(1.0)),
+            vs_bot: h.aggressor() == Some(bot),
+            committed: h.street_commit(p) > 0,
+        }
+    }
+}
+
+/// The standard normal's distribution function (Abramowitz and Stegun 7.1.26, within 1.5e-7).
+fn phi(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * (x.abs() / std::f64::consts::SQRT_2));
+    let y = 1.0 - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t + 0.254_829_592) * t * (-(x * x) / 2.0).exp();
+    if x >= 0.0 {
+        0.5 * (1.0 + y)
+    } else {
+        0.5 * (1.0 - y)
+    }
+}
+
+/// The chance a read of `value` with normal noise `noise` falls below `t`.
+fn read_below(t: f64, value: f64, noise: f64) -> f64 {
+    if noise <= 0.0 {
+        return f64::from(u8::from(value < t));
+    }
+    phi((t - value) / noise)
+}
+
+/// A hole's chances against what it is ranked against, per runout: (win, tie).
+pub type Outcome = (f64, f64);
+
+/// The shares won a postflop read is one minus: 0, half a runout, ..., all [`STRENGTH_RUNOUTS`] (a tie half a win).
+const HALF_RUNOUTS: usize = 2 * STRENGTH_RUNOUTS + 1;
+
+/// For each share won, the chance its read (one minus the share, raised to `power`, plus the noise) falls below `t`.
+fn read_table(t: f64, power: f64, noise: f64) -> [f64; HALF_RUNOUTS] {
+    std::array::from_fn(|i| read_below(t, (1.0 - i as f64 / (HALF_RUNOUTS - 1) as f64).powf(power), noise))
+}
+
+/// The chance a postflop read falls below the threshold `table` was made for ([`read_table`]), for a hole of
+/// per-runout chances `o` over [`STRENGTH_RUNOUTS`] runouts: k wins and j ties in each of their 16!/(k! j! rest!) orders.
+fn postflop_below(table: &[f64; HALF_RUNOUTS], o: Outcome) -> f64 {
+    const N: usize = STRENGTH_RUNOUTS;
+    static WAYS: OnceLock<Vec<f64>> = OnceLock::new();
+    let ways = WAYS.get_or_init(|| {
+        let fact = |x: usize| (1..=x).fold(1.0, |a, i| a * i as f64);
+        (0..=N).flat_map(|k| (0..=N).map(move |j| if k + j <= N { fact(N) / (fact(k) * fact(j) * fact(N - k - j)) } else { 0.0 })).collect()
+    });
+    let (win, tie) = (o.0.clamp(0.0, 1.0), o.1.clamp(0.0, 1.0));
+    let loss = (1.0 - win - tie).max(0.0);
+    let pow = |x: f64| -> [f64; N + 1] {
+        let mut v = [1.0; N + 1];
+        for i in 1..=N {
+            v[i] = v[i - 1] * x;
+        }
+        v
+    };
+    let (pw, pt, pl) = (pow(win), pow(tie), pow(loss));
+    let mut acc = 0.0;
+    for k in 0..=N {
+        for j in 0..=(N - k) {
+            acc += ways[k * (N + 1) + j] * pw[k] * pt[j] * pl[N - k - j] * table[2 * k + j];
+        }
+    }
+    acc
+}
+
+/// [`chances`] at one spot for many holes: the spot's thresholds and read tables made once.
+pub struct Chances {
+    preflop: bool,
+    /// Preflop: (fold, raise) thresholds, the shove share, the noise; postflop the read tables.
+    pre: (f64, f64, f64, f64),
+    check: bool,
+    pairs: bool,
+    guess: f64,
+    cont: f64,
+    low: f64,
+    guess_raises: bool,
+    cont_table: [f64; HALF_RUNOUTS],
+    low_table: [f64; HALF_RUNOUTS],
+}
+
+impl Chances {
+    pub fn new(m: &Model, spot: &Spot) -> Chances {
+        let blank = [0.0; HALF_RUNOUTS];
+        if spot.street == Street::Preflop {
+            if spot.can_check {
+                return Chances { preflop: true, pre: (f64::INFINITY, m.bb_raise, 0.0, m.preflop_noise), check: true, pairs: false, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
+            }
+            let (raise, cont) = if spot.raises == 0 {
+                m.unopened
+            } else {
+                let z = RAISE_SIZES_BB.iter().position(|&b| spot.bet_bb < b).unwrap_or(RAISE_SIZES_BB.len());
+                m.facing_raise[(usize::from(spot.raises) - 1).min(1)][z]
+            };
+            let shove = if spot.short { m.short_shove } else { 0.0 };
+            return Chances { preflop: true, pre: (cont, raise.min(cont), shove, m.preflop_noise), check: false, pairs: false, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
+        }
+        let table = usize::from(spot.multiway);
+        let st = match spot.street {
+            Street::Flop => 0,
+            Street::Turn => 1,
+            _ => 2,
+        };
+        if spot.can_check {
+            let bet = m.unbet[table][st].iter().sum::<f64>();
+            return Chances { preflop: false, pre: (0.0, 0.0, 0.0, 0.0), check: true, pairs: false, guess: 0.0, cont: bet, low: bet, guess_raises: false, cont_table: read_table(bet, m.postflop_power, m.unbet_noise), low_table: blank };
+        }
+        let facing = match &m.facing_reraised {
+            Some(reraised) if spot.committed => reraised,
+            _ if spot.vs_bot => &m.facing_bot,
+            _ => &m.facing,
+        };
+        let z = spot.size;
+        let (raise, cont) = facing[table][st][z];
+        let low = raise.min(cont);
+        let noise = m.facing_noise[z];
+        Chances {
+            preflop: false,
+            pre: (0.0, 0.0, 0.0, 0.0),
+            check: false,
+            pairs: z >= m.range_from,
+            guess: m.facing_guess[z],
+            cont,
+            low,
+            guess_raises: z < m.guess_calls_from,
+            cont_table: read_table(cont, m.postflop_power, noise),
+            low_table: read_table(low, m.postflop_power, noise),
+        }
+    }
+
+    /// The chance of each move for a hole of preflop rank `pre` and, postflop, per-runout chances `any` and `pairs`.
+    pub fn of(&self, pre: f64, any: Outcome, pairs: Outcome) -> [f64; 3] {
+        if self.preflop {
+            let (cont, low, shove, noise) = self.pre;
+            if self.check {
+                let raise = read_below(low, pre, noise);
+                return [1.0 - raise, 0.0, raise];
+            }
+            let fold = 1.0 - read_below(cont, pre, noise);
+            let raised = read_below(low, pre, noise);
+            return [(1.0 - shove) * fold, (1.0 - shove) * (1.0 - fold - raised).max(0.0), shove + (1.0 - shove) * raised];
+        }
+        if self.check {
+            let bet = postflop_below(&self.cont_table, any);
+            return [1.0 - bet, 0.0, bet];
+        }
+        let o = if self.pairs { pairs } else { any };
+        let g = self.guess;
+        let fold = 1.0 - ((1.0 - g) * postflop_below(&self.cont_table, o) + g * self.cont.clamp(0.0, 1.0));
+        let guessed = if self.guess_raises { self.low.clamp(0.0, 1.0) } else { 0.0 };
+        let raised = (1.0 - g) * postflop_below(&self.low_table, o) + g * guessed;
+        [fold, (1.0 - fold - raised).max(0.0), raised]
+    }
+}
+
+/// The chance of each of a Brasa player's three moves at `spot` with a hole of preflop rank `pre` ([`preflop_rank`])
+/// and, postflop, its per-runout chances `any` against one random hand and `pairs` against a hand that makes a pair
+/// ([`board_reads`]): [fold, or check with nothing to call; check or call; bet or raise]. The closed form of
+/// [`intent_by`]'s noisy read, for weighing a player's holes by what it did ([`Chances`] for many holes).
+pub fn chances(m: &Model, spot: &Spot, pre: f64, any: Outcome, pairs: Outcome) -> [f64; 3] {
+    Chances::new(m, spot).of(pre, any, pairs)
+}
+
+/// The per-runout chances a Brasa player reads its hole by on `board`, for each of `combos`: against one random hand
+/// ([`postflop_rank`]) and against a random hand that makes a pair ([`postflop_rank_vs_pairs`]), exact over every
+/// runout of the board and every opponent's hole. A combo touching the board gets none; on a board where so few holes
+/// make a pair that the player's read would give up on them, the second is the first.
+pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<Outcome>) {
+    use crate::search::{all_combos, combo_index, NUM_COMBOS};
+    use rayon::prelude::*;
+    let all = all_combos();
+    let touches = |c: &[Card; 2], cards: &[Card]| cards.contains(&c[0]) || cards.contains(&c[1]);
+    let in_range: Vec<bool> = all.iter().map(|c| !touches(c, board) && makes_a_pair(*c, board)).collect();
+    let deck: Vec<Card> = (0..52u8).filter(|c| !board.contains(c)).collect();
+    let runouts: Vec<Vec<Card>> = match 5 - board.len() {
+        0 => vec![Vec::new()],
+        1 => deck.iter().map(|&c| vec![c]).collect(),
+        _ => (0..deck.len()).flat_map(|i| ((i + 1)..deck.len()).map(move |j| (i, j))).map(|(i, j)| vec![deck[i], deck[j]]).collect(),
+    };
+    // per combo, summed over runouts: (wins, ties, opponents) against any hole, then against a hole making a pair
+    type Counts = Vec<[u64; 6]>;
+    let counts: Counts = runouts
+        .par_iter()
+        .fold(
+            || vec![[0u64; 6]; NUM_COMBOS],
+            |mut acc: Counts, runout| {
+                let mut full = [0 as Card; 7];
+                full[..board.len()].copy_from_slice(board);
+                full[board.len()..5].copy_from_slice(runout);
+                let dealt = &full[..5];
+                let mut order: Vec<(u32, u16)> = Vec::with_capacity(NUM_COMBOS);
+                for (i, c) in all.iter().enumerate() {
+                    if !touches(c, dealt) {
+                        let mut seven = full;
+                        seven[5] = c[0];
+                        seven[6] = c[1];
+                        order.push((eval7(&seven), i as u16));
+                    }
+                }
+                order.sort_unstable();
+                // the holes an opponent may hold, then those making a pair: in all and by card, those weaker so far
+                // in the sweep, those in the current tie, and those in all
+                let mut seen = [[0usize; 53]; 2];
+                let mut valid = [[0usize; 53]; 2];
+                for &(_, i) in &order {
+                    let c = all[usize::from(i)];
+                    for t in 0..=usize::from(in_range[usize::from(i)]) {
+                        valid[t][52] += 1;
+                        valid[t][c[0] as usize] += 1;
+                        valid[t][c[1] as usize] += 1;
+                    }
+                }
+                let mut g = 0;
+                while g < order.len() {
+                    let x = order[g].0;
+                    let end = g + order[g..].partition_point(|&(y, _)| y == x);
+                    let mut tie = [[0usize; 53]; 2];
+                    for &(_, i) in &order[g..end] {
+                        let c = all[usize::from(i)];
+                        for t in 0..=usize::from(in_range[usize::from(i)]) {
+                            tie[t][52] += 1;
+                            tie[t][c[0] as usize] += 1;
+                            tie[t][c[1] as usize] += 1;
+                        }
+                    }
+                    for &(_, i) in &order[g..end] {
+                        let (i, c) = (usize::from(i), all[usize::from(i)]);
+                        let (a, b) = (c[0] as usize, c[1] as usize);
+                        for t in 0..2 {
+                            // the hole itself is counted in all three when it is an opponent's possible hole too
+                            let own = usize::from(t == 0 || in_range[i]);
+                            acc[i][3 * t] += (seen[t][52] - seen[t][a] - seen[t][b]) as u64;
+                            acc[i][3 * t + 1] += (tie[t][52] + own - tie[t][a] - tie[t][b]) as u64;
+                            acc[i][3 * t + 2] += (valid[t][52] + own - valid[t][a] - valid[t][b]) as u64;
+                        }
+                    }
+                    for t in 0..2 {
+                        for k in 0..53 {
+                            seen[t][k] += tie[t][k];
+                        }
+                    }
+                    g = end;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![[0u64; 6]; NUM_COMBOS],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    for k in 0..6 {
+                        x[k] += y[k];
+                    }
+                }
+                a
+            },
+        );
+    let share = |w: u64, t: u64, n: u64| if n == 0 { (0.0, 1.0) } else { (w as f64 / n as f64, t as f64 / n as f64) };
+    combos
+        .iter()
+        .map(|c| {
+            if touches(c, board) {
+                return ((0.0, 0.0), (0.0, 0.0));
+            }
+            let k = counts[combo_index(c[0], c[1])];
+            let any = share(k[0], k[1], k[2]);
+            // the player's read draws up to PAIR_DRAWS holes for one that makes a pair in each of its runouts, else
+            // reads its hole against any hand
+            let pair_share = k[5] as f64 / k[2].max(1) as f64;
+            let gives_up = 1.0 - (1.0 - (1.0 - pair_share).powi(PAIR_DRAWS as i32)).powi(STRENGTH_RUNOUTS as i32) > 0.5;
+            (any, if gives_up { any } else { share(k[3], k[4], k[5]) })
+        })
+        .unzip()
+}
+
 /// The abstract raise on `acts` whose concrete total lands nearest `target`, or check/call when
 /// the menu has none.
 fn nearest_raise(h: &Hand, acts: &[AbsAction], abs: &Abstraction, target: u32) -> AbsAction {
@@ -757,6 +1069,93 @@ mod tests {
             (0..200).filter(|_| intent_by(&m, &shove, bot, &mut rng) != Intent::Fold).count()
         };
         assert_eq!((goes_on(bettor), goes_on(NO_BOT)), (200, 0));
+    }
+
+    /// [`chances`] at `h` for the player to act, against 20,000 of [`intent_by`]'s draws.
+    fn chances_match_draws(m: &Model, h: &Hand, bot: usize) {
+        let p = h.to_act();
+        let hole = h.hole(p);
+        let (any, pairs) = if h.street() == Street::Preflop { (vec![(0.0, 0.0)], vec![(0.0, 0.0)]) } else { board_reads(&[hole], h.board()) };
+        let closed = chances(m, &Spot::of(h, bot), preflop_rank(hole), any[0], pairs[0]);
+        let mut rng = SmallRng::seed_from_u64(41);
+        let n = 20_000;
+        let mut drawn = [0.0; 3];
+        for _ in 0..n {
+            let k = match intent_by(m, h, bot, &mut rng) {
+                Intent::Fold => 0,
+                Intent::CheckCall if h.can_check() => 0,
+                Intent::CheckCall => 1,
+                Intent::RaiseTo(_) => 2,
+            };
+            drawn[k] += 1.0 / f64::from(n);
+        }
+        assert!((closed.iter().sum::<f64>() - 1.0).abs() < 1e-9, "{closed:?}");
+        for k in 0..3 {
+            assert!((closed[k] - drawn[k]).abs() < 0.02, "{:?} {hole:?}: closed {closed:?}, drawn {drawn:?}", h.street());
+        }
+    }
+
+    #[test]
+    fn a_players_chance_of_each_move_in_closed_form_matches_its_draws() {
+        let m = Model::default();
+        // preflop: first in, facing a small raise and a huge one, the big blind's option, a short stack facing a raise
+        chances_match_draws(&m, &deal("Ts 8d"), NO_BOT);
+        chances_match_draws(&m, &deal("As Kd"), NO_BOT);
+        let mut small = deal("Ts 8d");
+        small.apply(PlayerAction::RaiseTo(250));
+        for _ in 0..2 {
+            small.apply(PlayerAction::Fold);
+        }
+        chances_match_draws(&m, &small, NO_BOT);
+        let mut huge = deal("Qs Qd");
+        huge.apply(PlayerAction::RaiseTo(6000));
+        for _ in 0..2 {
+            huge.apply(PlayerAction::Fold);
+        }
+        chances_match_draws(&m, &huge, NO_BOT);
+        let mut option = deal("9c 9d");
+        while !(option.to_act() == 2 && option.can_check()) {
+            option.apply(PlayerAction::CheckCall);
+        }
+        chances_match_draws(&m, &option, NO_BOT);
+        let cards = parse_cards("7c 2d").expect("cards parse");
+        let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
+        deck.insert(6, cards[0]);
+        deck.insert(7, cards[1]);
+        let deck: [u8; 52] = deck.try_into().expect("52 cards");
+        let cfg = HandConfig { num_players: 6, stack: 100_000, ..HandConfig::default() };
+        let mut short = Hand::new_with_stacks(&cfg, 3, deck, &[10_000, 10_000, 10_000, 2_000, 10_000, 10_000]);
+        while short.to_act() != 0 {
+            short.apply(PlayerAction::Fold);
+        }
+        short.apply(PlayerAction::RaiseTo(300));
+        while short.to_act() != 3 {
+            short.apply(PlayerAction::Fold);
+        }
+        assert!(Spot::of(&short, NO_BOT).short);
+        chances_match_draws(&m, &short, NO_BOT);
+        // postflop: an unbet flop, a small bet, a pot bet (read against pairs), a ten-pot shove (guesses only call),
+        // and a bet of the bot's
+        let unbet = {
+            let cards = parse_cards("9h 8h Ad Qd Kc 9c 2d").expect("cards parse");
+            let mut deck: Vec<u8> = (0..52u8).filter(|c| !cards.contains(c)).collect();
+            for (i, &c) in cards.iter().enumerate() {
+                deck.insert(i, c);
+            }
+            let deck: [u8; 52] = deck.try_into().expect("52 cards");
+            let cfg = HandConfig { num_players: 2, stack: 100_000, ..HandConfig::default() };
+            let mut h = Hand::new(&cfg, 0, deck);
+            h.apply(PlayerAction::CheckCall);
+            h.apply(PlayerAction::CheckCall);
+            assert!(h.street() == Street::Flop && h.can_check());
+            h
+        };
+        chances_match_draws(&m, &unbet, NO_BOT);
+        for (hole, bet) in [("9h 8h", 60), ("9h 8h", 200), ("Ks 4s", 200), ("7s 3h", 2000), ("Kh 9h", 2000)] {
+            let h = facing_flop_bet_with(hole, bet);
+            chances_match_draws(&m, &h, NO_BOT);
+            chances_match_draws(&m, &h, h.aggressor().expect("someone bet"));
+        }
     }
 
     #[test]
