@@ -81,6 +81,25 @@ pub struct Model {
     /// median rank 0.24 against 0.10: about half their shoves are any two cards.
     #[serde(default = "short_shove_default")]
     pub short_shove: f64,
+    /// From this size faced on, a player ranks its hand against the hands that make two pair or better instead of a
+    /// pair ([`NEVER`]: never), and with `strong_mw_only` only with others still in the hand: on live hands the callers
+    /// of bets of 6 pots or more held two pair or better or almost nothing, seldom top pair. A model without them
+    /// plays as before (and serializes as before).
+    #[serde(default = "never", skip_serializing_if = "is_never")]
+    pub strong_from: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strong_mw_only: bool,
+}
+
+/// A size bucket past every bet: a read that never applies.
+pub const NEVER: usize = 6;
+
+fn never() -> usize {
+    NEVER
+}
+
+fn is_never(size: &usize) -> bool {
+    *size >= NEVER
 }
 
 /// Below this effective stack (the player's chips against the raiser's, in big blinds) a Brasa player facing a raise
@@ -137,6 +156,8 @@ impl Default for Model {
             range_from: 2,
             guess_calls_from: 4,
             short_shove: short_shove_default(),
+            strong_from: NEVER,
+            strong_mw_only: false,
         }
     }
 }
@@ -355,12 +376,41 @@ fn makes_a_pair(hole: [Card; 2], board: &[Card]) -> bool {
     }
 }
 
+/// Whether `hole` makes two pair or better of its own on `board`: two pair on an unpaired board, trips with a hole card
+/// or a pocket pair, a straight or better unless the river's board plays.
+fn makes_two_pair(hole: [Card; 2], board: &[Card]) -> bool {
+    let mut all = [0 as Card; 7];
+    all[..board.len()].copy_from_slice(board);
+    all[board.len()..board.len() + 2].copy_from_slice(&hole);
+    let cat = category(&all[..board.len() + 2]);
+    let board_cat = category(board);
+    let pocket = rank(hole[0]) == rank(hole[1]);
+    let hits = hole.iter().any(|&c| board.iter().any(|&b| rank(b) == rank(c)));
+    match cat {
+        0 | 1 => false,
+        2 => board_cat == 0,
+        3 => pocket || hits,
+        _ => !(board.len() == 5 && board_cat >= 4 && cat == board_cat),
+    }
+}
+
 /// Random holes drawn for one that makes a pair before [`postflop_rank_vs_pairs`] gives up on the board.
 const PAIR_DRAWS: usize = 400;
 
 /// [`postflop_rank`] against a hand that makes a pair or better on the board instead of any hand; against any hand
 /// on a board where hardly any does (a straight or flush on the board that few holes beat with a better category).
 pub fn postflop_rank_vs_pairs(hole: [Card; 2], board: &[Card], rng: &mut SmallRng) -> f64 {
+    postflop_rank_vs(hole, board, rng, makes_a_pair)
+}
+
+/// [`postflop_rank`] against a hand that makes two pair or better on the board ([`Model::strong_from`]); against any
+/// hand on a board where hardly any does.
+pub fn postflop_rank_vs_strong(hole: [Card; 2], board: &[Card], rng: &mut SmallRng) -> f64 {
+    postflop_rank_vs(hole, board, rng, makes_two_pair)
+}
+
+/// [`postflop_rank`] against a hand drawn from the holes `keep` holds on the board.
+fn postflop_rank_vs(hole: [Card; 2], board: &[Card], rng: &mut SmallRng, keep: fn([Card; 2], &[Card]) -> bool) -> f64 {
     let mut used = [false; 52];
     for &c in hole.iter().chain(board) {
         used[c as usize] = true;
@@ -371,7 +421,7 @@ pub fn postflop_rank_vs_pairs(hole: [Card; 2], board: &[Card], rng: &mut SmallRn
     for _ in 0..STRENGTH_RUNOUTS {
         let drawn = (0..PAIR_DRAWS).find_map(|_| {
             let (a, b) = (live[rng.random_range(0..live.len())], live[rng.random_range(0..live.len())]);
-            (a != b && makes_a_pair([a, b], board)).then_some([a, b])
+            (a != b && keep([a, b], board)).then_some([a, b])
         });
         let Some(opp) = drawn else {
             return postflop_rank(hole, board, rng);
@@ -495,7 +545,13 @@ pub fn intent_by(m: &Model, h: &Hand, bot: usize, rng: &mut SmallRng) -> Intent 
     let r = if guess {
         rng.random::<f64>()
     } else {
-        let strength = if size >= m.range_from { postflop_rank_vs_pairs } else { postflop_rank };
+        let strength = if size >= m.strong_from && (!m.strong_mw_only || table == 1) {
+            postflop_rank_vs_strong
+        } else if size >= m.range_from {
+            postflop_rank_vs_pairs
+        } else {
+            postflop_rank
+        };
         read(strength(h.hole(p), h.board(), rng).max(0.0).powf(m.postflop_power), m.facing_noise[size], rng)
     };
     if r >= cont {
@@ -616,7 +672,8 @@ pub struct Chances {
     /// Preflop: (fold, raise) thresholds, the shove share, the noise; postflop the read tables.
     pre: (f64, f64, f64, f64),
     check: bool,
-    pairs: bool,
+    /// The read the spot ranks a hole by: 0 against any hand, 1 a pair, 2 two pair ([`BoardReads`]).
+    read: usize,
     guess: f64,
     cont: f64,
     low: f64,
@@ -630,7 +687,7 @@ impl Chances {
         let blank = [0.0; HALF_RUNOUTS];
         if spot.street == Street::Preflop {
             if spot.can_check {
-                return Chances { preflop: true, pre: (f64::INFINITY, m.bb_raise, 0.0, m.preflop_noise), check: true, pairs: false, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
+                return Chances { preflop: true, pre: (f64::INFINITY, m.bb_raise, 0.0, m.preflop_noise), check: true, read: 0, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
             }
             let (raise, cont) = if spot.raises == 0 {
                 m.unopened
@@ -639,7 +696,7 @@ impl Chances {
                 m.facing_raise[(usize::from(spot.raises) - 1).min(1)][z]
             };
             let shove = if spot.short { m.short_shove } else { 0.0 };
-            return Chances { preflop: true, pre: (cont, raise.min(cont), shove, m.preflop_noise), check: false, pairs: false, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
+            return Chances { preflop: true, pre: (cont, raise.min(cont), shove, m.preflop_noise), check: false, read: 0, guess: 0.0, cont: 0.0, low: 0.0, guess_raises: false, cont_table: blank, low_table: blank };
         }
         let table = usize::from(spot.multiway);
         let st = match spot.street {
@@ -649,7 +706,7 @@ impl Chances {
         };
         if spot.can_check {
             let bet = m.unbet[table][st].iter().sum::<f64>();
-            return Chances { preflop: false, pre: (0.0, 0.0, 0.0, 0.0), check: true, pairs: false, guess: 0.0, cont: bet, low: bet, guess_raises: false, cont_table: read_table(bet, m.postflop_power, m.unbet_noise), low_table: blank };
+            return Chances { preflop: false, pre: (0.0, 0.0, 0.0, 0.0), check: true, read: 0, guess: 0.0, cont: bet, low: bet, guess_raises: false, cont_table: read_table(bet, m.postflop_power, m.unbet_noise), low_table: blank };
         }
         let facing = match &m.facing_reraised {
             Some(reraised) if spot.committed => reraised,
@@ -664,7 +721,11 @@ impl Chances {
             preflop: false,
             pre: (0.0, 0.0, 0.0, 0.0),
             check: false,
-            pairs: z >= m.range_from,
+            read: if z >= m.strong_from && (!m.strong_mw_only || spot.multiway) {
+                2
+            } else {
+                usize::from(z >= m.range_from)
+            },
             guess: m.facing_guess[z],
             cont,
             low,
@@ -674,8 +735,9 @@ impl Chances {
         }
     }
 
-    /// The chance of each move for a hole of preflop rank `pre` and, postflop, per-runout chances `any` and `pairs`.
-    pub fn of(&self, pre: f64, any: Outcome, pairs: Outcome) -> [f64; 3] {
+    /// The chance of each move for a hole of preflop rank `pre` and, postflop, its per-runout chances `reads` against
+    /// any hand, a pair and two pair ([`BoardReads::at`]).
+    pub fn of(&self, pre: f64, reads: [Outcome; 3]) -> [f64; 3] {
         if self.preflop {
             let (cont, low, shove, noise) = self.pre;
             if self.check {
@@ -687,10 +749,10 @@ impl Chances {
             return [(1.0 - shove) * fold, (1.0 - shove) * (1.0 - fold - raised).max(0.0), shove + (1.0 - shove) * raised];
         }
         if self.check {
-            let bet = postflop_below(&self.cont_table, any);
+            let bet = postflop_below(&self.cont_table, reads[0]);
             return [1.0 - bet, 0.0, bet];
         }
-        let o = if self.pairs { pairs } else { any };
+        let o = reads[self.read];
         let g = self.guess;
         let fold = 1.0 - ((1.0 - g) * postflop_below(&self.cont_table, o) + g * self.cont.clamp(0.0, 1.0));
         let guessed = if self.guess_raises { self.low.clamp(0.0, 1.0) } else { 0.0 };
@@ -700,35 +762,51 @@ impl Chances {
 }
 
 /// The chance of each of a Brasa player's three moves at `spot` with a hole of preflop rank `pre` ([`preflop_rank`])
-/// and, postflop, its per-runout chances `any` against one random hand and `pairs` against a hand that makes a pair
+/// and, postflop, its per-runout chances against any hand, a hand that makes a pair and one that makes two pair
 /// ([`board_reads`]): [fold, or check with nothing to call; check or call; bet or raise]. The closed form of
 /// [`intent_by`]'s noisy read, for weighing a player's holes by what it did ([`Chances`] for many holes).
-pub fn chances(m: &Model, spot: &Spot, pre: f64, any: Outcome, pairs: Outcome) -> [f64; 3] {
-    Chances::new(m, spot).of(pre, any, pairs)
+pub fn chances(m: &Model, spot: &Spot, pre: f64, reads: [Outcome; 3]) -> [f64; 3] {
+    Chances::new(m, spot).of(pre, reads)
+}
+
+/// Each of some combos' per-runout chances against any hand, a hand making a pair and one making two pair.
+pub struct BoardReads {
+    pub any: Vec<Outcome>,
+    pub pairs: Vec<Outcome>,
+    pub strong: Vec<Outcome>,
+}
+
+impl BoardReads {
+    /// The `i`th combo's three reads, as [`Chances::of`] takes them.
+    pub fn at(&self, i: usize) -> [Outcome; 3] {
+        [self.any[i], self.pairs[i], self.strong[i]]
+    }
 }
 
 /// The per-runout chances a Brasa player reads its hole by on `board`, for each of `combos`: against one random hand
-/// ([`postflop_rank`]) and against a random hand that makes a pair ([`postflop_rank_vs_pairs`]), exact over every
-/// runout of the board and every opponent's hole. A combo touching the board gets none; on a board where so few holes
-/// make a pair that the player's read would give up on them, the second is the first.
-pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<Outcome>) {
+/// ([`postflop_rank`]), a random hand that makes a pair ([`postflop_rank_vs_pairs`]) and one that makes two pair
+/// ([`postflop_rank_vs_strong`]), exact over every runout of the board and every opponent's hole. A combo touching the
+/// board gets none; on a board where so few holes make a pair (or two pair) that the player's read would give up on
+/// them, that read is the first.
+pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> BoardReads {
     use crate::search::{all_combos, combo_index, NUM_COMBOS};
     use rayon::prelude::*;
     let all = all_combos();
     let touches = |c: &[Card; 2], cards: &[Card]| cards.contains(&c[0]) || cards.contains(&c[1]);
-    let in_range: Vec<bool> = all.iter().map(|c| !touches(c, board) && makes_a_pair(*c, board)).collect();
+    let ranges: [Vec<bool>; 2] = [makes_a_pair as fn([Card; 2], &[Card]) -> bool, makes_two_pair].map(|keep| all.iter().map(|c| !touches(c, board) && keep(*c, board)).collect());
     let deck: Vec<Card> = (0..52u8).filter(|c| !board.contains(c)).collect();
     let runouts: Vec<Vec<Card>> = match 5 - board.len() {
         0 => vec![Vec::new()],
         1 => deck.iter().map(|&c| vec![c]).collect(),
         _ => (0..deck.len()).flat_map(|i| ((i + 1)..deck.len()).map(move |j| (i, j))).map(|(i, j)| vec![deck[i], deck[j]]).collect(),
     };
-    // per combo, summed over runouts: (wins, ties, opponents) against any hole, then against a hole making a pair
-    type Counts = Vec<[u64; 6]>;
+    // per combo, summed over runouts: (wins, ties, opponents) against any hole, a hole making a pair, then two pair
+    type Counts = Vec<[u64; 9]>;
+    let keeps = |t: usize, i: usize| t == 0 || ranges[t - 1][i];
     let counts: Counts = runouts
         .par_iter()
         .fold(
-            || vec![[0u64; 6]; NUM_COMBOS],
+            || vec![[0u64; 9]; NUM_COMBOS],
             |mut acc: Counts, runout| {
                 let mut full = [0 as Card; 7];
                 full[..board.len()].copy_from_slice(board);
@@ -744,13 +822,13 @@ pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<O
                     }
                 }
                 order.sort_unstable();
-                // the holes an opponent may hold, then those making a pair: in all and by card, those weaker so far
-                // in the sweep, those in the current tie, and those in all
-                let mut seen = [[0usize; 53]; 2];
-                let mut valid = [[0usize; 53]; 2];
+                // the holes an opponent may hold, those making a pair, two pair: in all and by card, those weaker so
+                // far in the sweep, those in the current tie, and those in all
+                let mut seen = [[0usize; 53]; 3];
+                let mut valid = [[0usize; 53]; 3];
                 for &(_, i) in &order {
                     let c = all[usize::from(i)];
-                    for t in 0..=usize::from(in_range[usize::from(i)]) {
+                    for t in (0..3).filter(|&t| keeps(t, usize::from(i))) {
                         valid[t][52] += 1;
                         valid[t][c[0] as usize] += 1;
                         valid[t][c[1] as usize] += 1;
@@ -760,10 +838,10 @@ pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<O
                 while g < order.len() {
                     let x = order[g].0;
                     let end = g + order[g..].partition_point(|&(y, _)| y == x);
-                    let mut tie = [[0usize; 53]; 2];
+                    let mut tie = [[0usize; 53]; 3];
                     for &(_, i) in &order[g..end] {
                         let c = all[usize::from(i)];
-                        for t in 0..=usize::from(in_range[usize::from(i)]) {
+                        for t in (0..3).filter(|&t| keeps(t, usize::from(i))) {
                             tie[t][52] += 1;
                             tie[t][c[0] as usize] += 1;
                             tie[t][c[1] as usize] += 1;
@@ -772,15 +850,15 @@ pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<O
                     for &(_, i) in &order[g..end] {
                         let (i, c) = (usize::from(i), all[usize::from(i)]);
                         let (a, b) = (c[0] as usize, c[1] as usize);
-                        for t in 0..2 {
+                        for t in 0..3 {
                             // the hole itself is counted in all three when it is an opponent's possible hole too
-                            let own = usize::from(t == 0 || in_range[i]);
+                            let own = usize::from(keeps(t, i));
                             acc[i][3 * t] += (seen[t][52] - seen[t][a] - seen[t][b]) as u64;
                             acc[i][3 * t + 1] += (tie[t][52] + own - tie[t][a] - tie[t][b]) as u64;
                             acc[i][3 * t + 2] += (valid[t][52] + own - valid[t][a] - valid[t][b]) as u64;
                         }
                     }
-                    for t in 0..2 {
+                    for t in 0..3 {
                         for k in 0..53 {
                             seen[t][k] += tie[t][k];
                         }
@@ -791,10 +869,10 @@ pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<O
             },
         )
         .reduce(
-            || vec![[0u64; 6]; NUM_COMBOS],
+            || vec![[0u64; 9]; NUM_COMBOS],
             |mut a, b| {
                 for (x, y) in a.iter_mut().zip(&b) {
-                    for k in 0..6 {
+                    for k in 0..9 {
                         x[k] += y[k];
                     }
                 }
@@ -802,21 +880,28 @@ pub fn board_reads(combos: &[[Card; 2]], board: &[Card]) -> (Vec<Outcome>, Vec<O
             },
         );
     let share = |w: u64, t: u64, n: u64| if n == 0 { (0.0, 1.0) } else { (w as f64 / n as f64, t as f64 / n as f64) };
-    combos
-        .iter()
-        .map(|c| {
-            if touches(c, board) {
-                return ((0.0, 0.0), (0.0, 0.0));
-            }
-            let k = counts[combo_index(c[0], c[1])];
-            let any = share(k[0], k[1], k[2]);
-            // the player's read draws up to PAIR_DRAWS holes for one that makes a pair in each of its runouts, else
-            // reads its hole against any hand
-            let pair_share = k[5] as f64 / k[2].max(1) as f64;
-            let gives_up = 1.0 - (1.0 - (1.0 - pair_share).powi(PAIR_DRAWS as i32)).powi(STRENGTH_RUNOUTS as i32) > 0.5;
-            (any, if gives_up { any } else { share(k[3], k[4], k[5]) })
-        })
-        .unzip()
+    let mut reads = BoardReads { any: Vec::with_capacity(combos.len()), pairs: Vec::with_capacity(combos.len()), strong: Vec::with_capacity(combos.len()) };
+    for c in combos {
+        if touches(c, board) {
+            reads.any.push((0.0, 0.0));
+            reads.pairs.push((0.0, 0.0));
+            reads.strong.push((0.0, 0.0));
+            continue;
+        }
+        let k = counts[combo_index(c[0], c[1])];
+        let any = share(k[0], k[1], k[2]);
+        // the player's read draws up to PAIR_DRAWS holes for one in its range in each of its runouts, else reads its
+        // hole against any hand
+        let read = |t: usize| {
+            let kept = k[3 * t + 2] as f64 / k[2].max(1) as f64;
+            let gives_up = 1.0 - (1.0 - (1.0 - kept).powi(PAIR_DRAWS as i32)).powi(STRENGTH_RUNOUTS as i32) > 0.5;
+            if gives_up { any } else { share(k[3 * t], k[3 * t + 1], k[3 * t + 2]) }
+        };
+        reads.any.push(any);
+        reads.pairs.push(read(1));
+        reads.strong.push(read(2));
+    }
+    reads
 }
 
 /// The abstract raise on `acts` whose concrete total lands nearest `target`, or check/call when
@@ -1075,8 +1160,8 @@ mod tests {
     fn chances_match_draws(m: &Model, h: &Hand, bot: usize) {
         let p = h.to_act();
         let hole = h.hole(p);
-        let (any, pairs) = if h.street() == Street::Preflop { (vec![(0.0, 0.0)], vec![(0.0, 0.0)]) } else { board_reads(&[hole], h.board()) };
-        let closed = chances(m, &Spot::of(h, bot), preflop_rank(hole), any[0], pairs[0]);
+        let reads = if h.street() == Street::Preflop { [(0.0, 0.0); 3] } else { board_reads(&[hole], h.board()).at(0) };
+        let closed = chances(m, &Spot::of(h, bot), preflop_rank(hole), reads);
         let mut rng = SmallRng::seed_from_u64(41);
         let n = 20_000;
         let mut drawn = [0.0; 3];
@@ -1156,6 +1241,37 @@ mod tests {
             chances_match_draws(&m, &h, NO_BOT);
             chances_match_draws(&m, &h, h.aggressor().expect("someone bet"));
         }
+    }
+
+    #[test]
+    fn facing_a_giant_bet_a_strong_reader_ranks_its_hole_against_two_pair_and_better() {
+        // two pair of its own on an unpaired board, a set, trips with a hole card; not a pocket pair under a paired
+        // board, nor the board's own trips
+        let two = |hole: &str, board: &str| {
+            let h = parse_cards(hole).expect("a hole");
+            makes_two_pair([h[0], h[1]], &parse_cards(board).expect("a board"))
+        };
+        assert!(two("Kh 9h", "Kc 9c 2d") && two("2h 2s", "Kc 9c 2d") && two("Kh 4s", "Kc Kd 2d"));
+        assert!(!two("Qh Qs", "Kc Kd 2d") && !two("Ah 4s", "Kc Kd Ks") && !two("Kh Qh", "Kc 9c 2d"));
+        // a model without the read serializes as before and plays as before
+        let m = Model::default();
+        let json = serde_json::to_value(&m).expect("serializes");
+        assert!(json.get("strong_from").is_none() && json.get("strong_mw_only").is_none());
+        let parsed: Model = serde_json::from_value(json).expect("parses");
+        assert_eq!((parsed.strong_from, parsed.strong_mw_only), (NEVER, false));
+        // top pair, top kicker facing a ten-pot shove: it continues far less when read against two pair
+        let strong = Model { strong_from: 5, ..Model::default() };
+        let shove = facing_flop_bet_with("As Kh", 2000);
+        let (plain, against_two) = (continue_share(&m, &shove, 4000), continue_share(&strong, &shove, 4000));
+        assert!(against_two < plain - 0.2, "top pair continues {plain} against pairs, {against_two} against two pair");
+        // and the closed form follows the read, all pots and multiway only (heads-up here: the pair read)
+        chances_match_draws(&strong, &shove, NO_BOT);
+        chances_match_draws(&strong, &facing_flop_bet_with("Kh 9h", 2000), NO_BOT);
+        let multiway_only = Model { strong_mw_only: true, ..strong.clone() };
+        chances_match_draws(&multiway_only, &shove, NO_BOT);
+        let hole = shove.hole(shove.to_act());
+        let closed = |m: &Model| chances(m, &Spot::of(&shove, NO_BOT), preflop_rank(hole), board_reads(&[hole], shove.board()).at(0));
+        assert_eq!(closed(&multiway_only), closed(&m));
     }
 
     #[test]
