@@ -286,6 +286,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                unseen_flop_resolve: false,
                 model_p: None,
                 menu: None,
             },

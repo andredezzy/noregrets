@@ -128,6 +128,12 @@ pub struct SearchParams {
     /// Heads-up flops without a value net run the MCCFR resolve (as Pluribus
     /// searched every postflop decision) instead of acting from the blueprint.
     pub flop_resolve: bool,
+    /// Heads-up flops the blueprint holds no strategy for run the MCCFR
+    /// resolve instead of acting from the blueprint, to the end of the hand:
+    /// past a spot it never trained, the blueprint has no strategy for the
+    /// depth-limit leaves to roll out. Its other heads-up flops stay with it
+    /// (unless `flop_resolve`).
+    pub unseen_flop_resolve: bool,
     /// Restricted Nash response inside the resolve: in this share of its
     /// traversals the hero traverses against opponents playing the Brasa
     /// model (`brasa::action`); the rest are ordinary self-play. None =
@@ -188,6 +194,7 @@ impl Default for SearchParams {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            unseen_flop_resolve: false,
             model_p: None,
             menu: None,
         }
@@ -303,6 +310,13 @@ impl Policy {
             .expect("check/call is always legal");
         probs[call] = 1.0;
         (acts, probs)
+    }
+
+    /// Whether the blueprint holds a strategy for the player to act on
+    /// `shadow` at `hist`, whatever its menu.
+    fn blueprint_holds(&self, shadow: &Hand, hist: &[u8], rng: &mut SmallRng) -> bool {
+        let bucket = self.abs.key_bucket(shadow, shadow.hole(shadow.to_act()), rng);
+        self.blueprint.get(bucket, hist).is_some()
     }
 
     /// Pick an abstract action for the player to act on `h` from the
@@ -434,6 +448,7 @@ impl Policy {
         }
         // Flop spots with two live players and a value net: ReBeL-style
         // depth-limited vector solving with learned leaf values.
+        let mut unseen = false;
         if real.street() == Street::Flop && real.live_count() == 2 {
             // The net's leaf values are equilibrium values: no use against the model.
             if let (Some(tr), Some(net), false) = (tracker, &self.value_net, model) {
@@ -445,12 +460,13 @@ impl Policy {
             // blueprint here (measured: ≈0 in self-play; vs Slumbot it got
             // 200bb in at ~18% equity on 51 flops in 10k hands). The exact
             // turn/river solvers take over on later streets.
-            if !params.flop_resolve {
+            unseen = params.unseen_flop_resolve && !self.blueprint_holds(shadow, hist, rng);
+            if !params.flop_resolve && !unseen {
                 return blueprint(rng);
             }
         }
         let leaf = || {
-            (real.street() == Street::Flop).then(|| LeafCfg {
+            (real.street() == Street::Flop && !unseen).then(|| LeafCfg {
                 blueprint: self.blueprint.clone(),
                 abs: self.abs.clone(),
                 limit: Street::Flop,
@@ -944,6 +960,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                unseen_flop_resolve: false,
                 model_p: None,
                 menu: None,
             },
@@ -1203,6 +1220,70 @@ mod tests {
         assert_eq!((river.source, river.work), (SearchSource::River, None));
     }
 
+    /// A heads-up flop the blueprint never trained is the MCCFR resolve's under
+    /// `unseen_flop_resolve`, the blueprint's (and its check/call default)
+    /// without it; a flop the blueprint holds stays with the blueprint.
+    #[test]
+    fn an_unseen_heads_up_flop_is_resolved_only_under_unseen_flop_resolve() {
+        let hand_cfg = HandConfig {
+            num_players: 2,
+            stack: 2_000,
+            sb: 50,
+            bb: 100,
+        };
+        let abs = Arc::new(abs_small());
+        let train_cfg = TrainConfig {
+            hand: hand_cfg.clone(),
+            prune_after: u64::MAX,
+            ..TrainConfig::default()
+        };
+        let mut h = Hand::new(&hand_cfg, 0, deck_with("As Ks 2c 7d Qs Js Ts 3h 4d"));
+        let mut hist: Vec<u8> = Vec::new();
+        for _ in 0..2 {
+            h.apply(abs.concrete(&h, AbsAction::CheckCall));
+            hist.push(AbsAction::CheckCall.token());
+        }
+        hist.push(crate::abstraction::TOKEN_STREET_SEP);
+        assert_eq!((h.street(), h.live_count()), (Street::Flop, 2));
+        let mut tracker = RangeTracker::new(2);
+        tracker.exclude(h.board());
+        let search = |policy: &Policy, unseen_flop_resolve: bool| {
+            let params = SearchParams {
+                time_ms: 60_000,
+                max_iters: 300,
+                unseen_flop_resolve,
+                ..SearchParams::default()
+            };
+            let mut rng = SmallRng::seed_from_u64(5);
+            policy.search_dist_measured(&h, &h, &hist, params, &train_cfg, Some(&tracker), None, None, &mut rng)
+        };
+
+        let empty = empty_policy(&abs, 2);
+        let off = search(&empty, false);
+        assert_eq!((off.source, off.work), (SearchSource::Blueprint, None));
+        let on = search(&empty, true);
+        assert_eq!(on.source, SearchSource::Resolve);
+        assert_eq!(on.work.map(|w| w.iterations), Some(300));
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        let bucket = abs.key_bucket(&h, h.hole(h.to_act()), &mut rng);
+        let acts = abs.abstract_actions(&h);
+        let mut strategies = crate::cfr::StrategyMap::default();
+        strategies.insert(&make_key(bucket, &hist), &vec![1.0 / acts.len() as f32; acts.len()]);
+        let held = Policy::new(
+            Blueprint {
+                strategies,
+                iterations: 0,
+                num_players: 2,
+                abs_cfg: AbsConfig::default(),
+                centroids: None,
+            },
+            abs.clone(),
+        );
+        let kept = search(&held, true);
+        assert_eq!((kept.source, kept.work), (SearchSource::Blueprint, None));
+    }
+
     /// Safe (gadget) river resolving end to end through act_with_search:
     /// rollout-estimated safety values + gadget solve must still call the
     /// shove with the nuts.
@@ -1279,6 +1360,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                unseen_flop_resolve: false,
                 model_p: None,
                 menu: None,
             },
@@ -1359,6 +1441,7 @@ mod tests {
                     adaptive: false,
                     round_root: true,
                     flop_resolve: false,
+                    unseen_flop_resolve: false,
                     model_p: None,
                     menu: None,
                 },
@@ -1430,6 +1513,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            unseen_flop_resolve: false,
             model_p: None,
             menu: None,
         };
@@ -1566,6 +1650,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            unseen_flop_resolve: false,
             model_p: None,
             menu: None,
         };
@@ -1679,6 +1764,7 @@ mod tests {
             adaptive: false,
             round_root: true,
             flop_resolve: false,
+            unseen_flop_resolve: false,
             model_p: None,
             menu: None,
         };
@@ -1771,6 +1857,7 @@ mod tests {
                 adaptive: false,
                 round_root: true,
                 flop_resolve: false,
+                unseen_flop_resolve: false,
                 model_p: None,
                 menu: None,
             },
